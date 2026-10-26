@@ -125,6 +125,9 @@ See [Publish the Windows image to Amazon ECR](ECR.md) for host-side PowerShell
 instructions to create a private repository, authenticate, push
 `deer-windows:local`, and verify the uploaded image by digest. The guide includes
 IAM permissions, Windows base-layer considerations, and credential cleanup.
+For local Windows publishing, install and configure the Amazon ECR credential
+helper as directed there; it bypasses Docker Desktop/Windows credential-storage
+errors and authenticates ECR pushes and pulls without manual `docker login`.
 
 ## Run
 
