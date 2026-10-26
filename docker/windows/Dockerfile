@@ -16,7 +16,8 @@ RUN C:\container\Install-Container.ps1 -Component EnergyPlus
 RUN C:\container\Install-Container.ps1 -Component Modelkit
 RUN C:\container\Install-Container.ps1 -Component Anaconda
 
-ENV PATH="C:\Program Files\PowerShell\7;C:\Program Files\Git\cmd;C:\Program Files\Amazon\AWSCLIV2;C:\Modelkit\bin;C:\ProgramData\Anaconda3;C:\ProgramData\Anaconda3\Scripts;${PATH}"
+# Windows base-image PATH is not reliably available to Docker ENV expansion.
+ENV PATH="C:\Program Files\PowerShell\7;C:\Program Files\Git\cmd;C:\Program Files\Amazon\AWSCLIV2;C:\Modelkit\bin;C:\ProgramData\Anaconda3;C:\ProgramData\Anaconda3\Scripts;C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0"
 SHELL ["C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoLogo", "-NoProfile", "-Command"]
 
 COPY ["workflow", "C:\\DEER\\deer-cloud-compute-setup\\workflow\\"]

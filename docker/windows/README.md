@@ -80,6 +80,13 @@ the `py314` environment, Python imports and dependency consistency, workflow
 module loading, and long-path file creation. It does not perform a full
 simulation or contact your AWS account.
 
+The image explicitly includes the standard Windows system directories in PATH.
+The checks also execute Windows PowerShell 5.1 and `chcp.com`, which helper
+scripts can require even when their parent commands return exit code zero.
+Messages such as `'powershell' is not recognized` or `'chcp' is not recognized`
+are not expected; rebuild with the current Dockerfile if using an older image
+with missing Windows PATH entries.
+
 ### Troubleshooting DNS during installation
 
 The build needs outbound HTTPS and working DNS for installer downloads, Conda,

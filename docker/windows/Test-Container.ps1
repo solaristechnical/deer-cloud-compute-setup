@@ -26,6 +26,8 @@ if (-not $IsWindows) {
 }
 
 Assert-NativeCommand 'pwsh.exe' @('-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()') '^7\.'
+Assert-NativeCommand 'powershell.exe' @('-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()') '^5\.1\.'
+Assert-NativeCommand 'chcp.com' @()
 Assert-NativeCommand 'git.exe' @('--version') 'git version'
 Assert-NativeCommand 'git.exe' @('config', '--system', '--get', 'core.longpaths') '^true$'
 Assert-NativeCommand 'aws.exe' @('--version') 'aws-cli/2\.'
