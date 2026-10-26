@@ -1,0 +1,13 @@
+version: 0.2
+
+env:
+  shell: powershell.exe
+  exported-variables:
+    - IMAGE_URI
+    - IMAGE_DIGEST
+    - SOURCE_COMMIT
+
+phases:
+  build:
+    commands:
+      - '& .\docker\windows\aws\Publish-Image.ps1'

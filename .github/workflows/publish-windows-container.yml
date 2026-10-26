@@ -1,0 +1,142 @@
+name: Build and publish Windows container on AWS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-windows-container
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_BUILD_ROLE_ARN: ${{ vars.AWS_BUILD_ROLE_ARN }}
+      WINDOWS_CODEBUILD_PROJECT: ${{ vars.WINDOWS_CODEBUILD_PROJECT }}
+      WINDOWS_BUILD_SOURCE_BUCKET: ${{ vars.WINDOWS_BUILD_SOURCE_BUCKET }}
+      AWS_PAGER: ''
+    steps:
+      - name: Check out the selected main commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate AWS configuration
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('AWS_BUILD_ROLE_ARN', 'WINDOWS_CODEBUILD_PROJECT', 'WINDOWS_BUILD_SOURCE_BUCKET')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Set the repository Actions variable $name from the CloudFormation outputs."
+            }
+          }
+
+      - name: Authenticate to AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 14400
+          role-session-name: windows-image-${{ github.run_id }}
+
+      - name: Upload the exact source snapshot
+        id: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'windows-build-source.zip'
+          $key = "sources/$env:GITHUB_RUN_ID/$env:GITHUB_RUN_ATTEMPT/$env:GITHUB_SHA.zip"
+          "key=$key" >> $env:GITHUB_OUTPUT
+          git archive --format=zip "--output=$archive" HEAD docker/windows serversetup/requirements.txt workflow
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive creation failed.' }
+          aws s3 cp $archive "s3://$env:WINDOWS_BUILD_SOURCE_BUCKET/$key" --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw 'Build source upload failed.' }
+
+      - name: Start Windows CodeBuild
+        id: build
+        env:
+          SOURCE_KEY: ${{ steps.source.outputs.key }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $request = @{
+            projectName = $env:WINDOWS_CODEBUILD_PROJECT
+            sourceLocationOverride = "$env:WINDOWS_BUILD_SOURCE_BUCKET/$env:SOURCE_KEY"
+            environmentVariablesOverride = @(
+              @{ name = 'IMAGE_TAG'; value = "sha-$env:GITHUB_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"; type = 'PLAINTEXT' },
+              @{ name = 'SOURCE_COMMIT'; value = $env:GITHUB_SHA; type = 'PLAINTEXT' }
+            )
+          }
+          $file = Join-Path $env:RUNNER_TEMP 'start-windows-build.json'
+          $request | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $file -Encoding utf8NoBOM
+          $response = aws codebuild start-build --cli-input-json "file://$file" --output json
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to start Windows CodeBuild.' }
+          $build = ($response | ConvertFrom-Json).build
+          if (-not $build.id) { throw 'CodeBuild did not return a build ID.' }
+          "id=$($build.id)" >> $env:GITHUB_OUTPUT
+          "## Windows container build`n`nCodeBuild ID: ``$($build.id)``" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Wait for build, tests, and ECR publication
+        env:
+          BUILD_ID: ${{ steps.build.outputs.id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $deadline = [DateTime]::UtcNow.AddMinutes(215)
+          do {
+            $response = aws codebuild batch-get-builds --ids $env:BUILD_ID --output json
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to read CodeBuild status.' }
+            $build = ($response | ConvertFrom-Json).builds | Select-Object -First 1
+            if (-not $build) { throw 'CodeBuild build not found.' }
+            Write-Host "$($build.buildStatus): $($build.currentPhase)"
+            if ($build.logs.deepLink) { Write-Host "CloudWatch logs: $($build.logs.deepLink)" }
+            if ($build.buildStatus -ne 'IN_PROGRESS') { break }
+            if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for CodeBuild.' }
+            Start-Sleep -Seconds 30
+          } while ($true)
+          if ($build.buildStatus -ne 'SUCCEEDED') {
+            $build.phases | ConvertTo-Json -Depth 8 | Write-Host
+            throw "CodeBuild ended with status $($build.buildStatus)."
+          }
+          $published = @{}
+          foreach ($item in $build.exportedEnvironmentVariables) { $published[$item.name] = $item.value }
+          if (-not $published.IMAGE_URI -or $published.IMAGE_DIGEST -notmatch '^sha256:[0-9a-f]{64}$') {
+            throw 'Successful build did not export a verified image URI and digest.'
+          }
+          if ($published.SOURCE_COMMIT -ne $env:GITHUB_SHA) { throw 'Published source commit mismatch.' }
+          $repository = ($published.IMAGE_URI -split ':')[0]
+          @"
+          - Source commit: ``$env:GITHUB_SHA``
+          - Image tag: ``$($published.IMAGE_URI)``
+          - Verified digest: ``$repository@$($published.IMAGE_DIGEST)``
+          - [CloudWatch build logs]($($build.logs.deepLink))
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Stop unfinished cloud build
+        if: always() && steps.build.outputs.id != ''
+        env:
+          BUILD_ID: ${{ steps.build.outputs.id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $response = aws codebuild batch-get-builds --ids $env:BUILD_ID --output json
+          if ($LASTEXITCODE -ne 0) { throw "Unable to check cleanup status; inspect CodeBuild $env:BUILD_ID." }
+          $build = ($response | ConvertFrom-Json).builds | Select-Object -First 1
+          if (-not $build) { throw 'CodeBuild build not found during cleanup.' }
+          if ($build.buildStatus -eq 'IN_PROGRESS') {
+            aws codebuild stop-build --id $env:BUILD_ID
+            if ($LASTEXITCODE -ne 0) { throw "Unable to stop CodeBuild $env:BUILD_ID; stop it manually." }
+          }
+
+      - name: Remove uploaded source snapshot
+        if: always() && steps.source.outputs.key != ''
+        env:
+          SOURCE_KEY: ${{ steps.source.outputs.key }}
+        run: |
+          aws s3 rm "s3://$env:WINDOWS_BUILD_SOURCE_BUCKET/$env:SOURCE_KEY" --only-show-errors
+          if ($LASTEXITCODE -ne 0) { throw 'Source cleanup failed; the bucket lifecycle expires sources after seven days.' }

@@ -5,6 +5,9 @@ Use an **Amazon Elastic Container Registry (ECR) private repository** to store
 the container. This guide assumes the authenticated AWS identity and the ECR
 repository are in the same AWS account, in the standard AWS commercial partition.
 
+To build and publish on AWS rather than a local host, use the
+[GitHub Actions and Windows CodeBuild guide](aws/README.md).
+
 ## Prerequisites and permissions
 
 - AWS CLI v2 installed on the host with an authorized profile. Prefer IAM

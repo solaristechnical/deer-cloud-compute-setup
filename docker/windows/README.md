@@ -121,6 +121,11 @@ packages would also need local mirrors or pre-downloaded dependencies.
 
 ## Publish to AWS
 
+For a GitHub-triggered build and publication entirely on AWS, use
+[Windows CodeBuild publishing](aws/README.md). It includes a CloudFormation
+template, GitHub OIDC setup, and a manually triggered main-branch workflow that
+builds, tests, and publishes to private ECR without a local Docker host.
+
 See [Publish the Windows image to Amazon ECR](ECR.md) for host-side PowerShell
 instructions to create a private repository, authenticate, push
 `deer-windows:local`, and verify the uploaded image by digest. The guide includes
