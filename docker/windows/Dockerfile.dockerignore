@@ -1,0 +1,17 @@
+**
+!docker
+docker/**
+!docker/windows
+docker/windows/**
+!docker/windows/Dockerfile
+!docker/windows/Install-Container.ps1
+!docker/windows/Test-Container.ps1
+!serversetup
+serversetup/**
+!serversetup/requirements.txt
+!workflow
+workflow/**
+!workflow/*.ps1
+!workflow/*.psm1
+!workflow/*.py
+!workflow/*.json
