@@ -119,6 +119,13 @@ Copying pre-downloaded installers into the image is possible but is not supporte
 by this Dockerfile. It would not make this build offline: Conda channels and pip
 packages would also need local mirrors or pre-downloaded dependencies.
 
+## Publish to AWS
+
+See [Publish the Windows image to Amazon ECR](ECR.md) for host-side PowerShell
+instructions to create a private repository, authenticate, push
+`deer-windows:local`, and verify the uploaded image by digest. The guide includes
+IAM permissions, Windows base-layer considerations, and credential cleanup.
+
 ## Run
 
 Interactive PowerShell:
