@@ -80,6 +80,38 @@ the `py314` environment, Python imports and dependency consistency, workflow
 module loading, and long-path file creation. It does not perform a full
 simulation or contact your AWS account.
 
+### Troubleshooting DNS during installation
+
+The build needs outbound HTTPS and working DNS for installer downloads, Conda,
+and pip. Docker supplies the build container's virtual network adapter; no
+adapter configuration belongs in the Dockerfile.
+
+If `Invoke-WebRequest` reports that `github.com` could not be resolved, test the
+container network rather than just the host:
+
+```powershell
+docker network ls
+docker run --rm --isolation=hyperv --network nat `
+  mcr.microsoft.com/windows/servercore:ltsc2022 powershell -NoProfile -Command `
+  "Resolve-DnsName github.com -ErrorAction Stop; (Invoke-WebRequest -UseBasicParsing -Uri https://github.com -Method Head -TimeoutSec 30).StatusCode"
+```
+
+On Docker Desktop hosts where the existing `Default Switch` network works but
+`nat` has DNS timeouts, select that network explicitly:
+
+```powershell
+docker build --isolation=hyperv --network "Default Switch" -f .\docker\windows\Dockerfile -t deer-windows:local .
+```
+
+Use `--network "Default Switch"` with `docker run` as well if runtime AWS/Git
+access needs it. This network is host-specific; use a working network from
+`docker network ls` on other hosts. Build network selection does not persist in
+the image.
+
+Copying pre-downloaded installers into the image is possible but is not supported
+by this Dockerfile. It would not make this build offline: Conda channels and pip
+packages would also need local mirrors or pre-downloaded dependencies.
+
 ## Run
 
 Interactive PowerShell:
