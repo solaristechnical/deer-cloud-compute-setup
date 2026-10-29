@@ -10,9 +10,12 @@ for index in 0 1 2 3; do
   bash -n "$test_dir/step-$index.sh"
 done
 
-export INSTANCE_ID=i-test MODEL_REPO=example/models COMMIT_SHA=0123456789abcdef
+export INSTANCE_ID=i-test
+export MODEL_REPO=solaristechnical/DEER-Prototypes-EnergyPlus
+export COMMIT_SHA=0123456789abcdef
 export MEASURE_PATH="commercial measures/Bob's \$(printf unsafe)"
 export S3_BUCKET=test-bucket WORKFLOW_PACKAGE_S3_KEY=githubactions/123/workflow.zip
+export SCENARIO_ID="Scenario Bob's \$(printf unsafe)"
 export GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
 
 sleep() { :; }
@@ -114,6 +117,8 @@ run_case() (
       jq -e --arg step "-RequestedSteps '$DEER_STEP'" \
         '.commands[0] | contains($step)' parameters.json > /dev/null
       jq -e '.executionTimeout == ["14400"]' parameters.json > /dev/null
+      jq -e --arg scenario "-ScenarioId 'Scenario Bob''s \$(printf unsafe)'" \
+        '.commands[0] | contains($scenario)' parameters.json > /dev/null
       ;;
     Failed|Cancelled|TimedOut)
       [[ "$SSM_STATUS" == "$MODE" && "$(cat poll-count)" == 1 ]]
@@ -140,7 +145,7 @@ run_case() (
   echo "PASS: $name"
 )
 
-for step in package-qc compose compose-qc simulate; do
+for step in package-qc compose compose-qc simulate-1 simulate-2; do
   run_case "$step-success" success success "$step"
 done
 run_case invocation-eventual-consistency success delayed
