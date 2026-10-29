@@ -1,0 +1,33 @@
+version: 1
+
+requiredConfiguration:
+
+  aws:
+    - AWS_REGION
+    - SIMULATION_BUCKET
+    - EC2_LAUNCH_TEMPLATE_ID
+    - EC2_LAUNCH_TEMPLATE_VERSION
+
+  runtime:
+    - REPOSITORY
+    - COMMIT_SHA
+    - MEASURE_PATH
+    - RUN_PROFILE
+    - RUN_ID
+    - RUN_ATTEMPT
+
+  workflow:
+    - REQUESTED_STEPS
+
+optionalConfiguration:
+
+  logging:
+    - CLOUDWATCH_LOG_GROUP
+
+requiredSecrets: []
+
+notes:
+  - GitHub Actions should use OIDC and IAM roles.
+  - AWS access keys should not be stored in the repository.
+  - Configuration values are supplied by environment variables.
+  - Local development may use a .env file that is gitignored.

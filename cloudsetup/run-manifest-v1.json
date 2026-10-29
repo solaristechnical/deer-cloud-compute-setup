@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://deer.solaris-technical.com/schemas/run-manifest-v1.json",
+  "title": "DEER Workflow Run Manifest",
+  "type": "object",
+
+  "$defs": {
+    "scenario": {
+      "type": "object",
+
+      "required": [
+        "scenarioId",
+        "relativePath",
+        "status",
+        "fileCount",
+        "totalBytes"
+      ],
+
+      "properties": {
+
+        "scenarioId": {
+          "type": "string"
+        },
+
+        "relativePath": {
+          "type": "string"
+        },
+
+        "status": {
+          "type": "string",
+          "enum": [
+            "discovered",
+            "validated",
+            "skipped",
+            "failed"
+          ]
+        },
+
+        "fileCount": {
+          "type": "integer"
+        },
+
+        "totalBytes": {
+          "type": "integer"
+        },
+
+        "expectedCompositions": {
+          "type": "integer"
+        },
+
+        "requiredFilesPresent": {
+          "type": "boolean"
+        },
+
+        "climatesCsv": {
+          "type": ["string", "null"]
+        },
+
+        "cohortsCsv": {
+          "type": ["string", "null"]
+        },
+
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "stepStatus": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "running",
+            "succeeded",
+            "failed",
+            "skipped",
+            "cancelled"
+          ]
+        },
+        "startTime": {
+          "type": ["string", "null"]
+        },
+        "endTime": {
+          "type": ["string", "null"]
+        },
+        "durationSeconds": {
+          "type": ["number", "null"]
+        },
+        "failureMessage": {
+          "type": ["string", "null"]
+        }
+      }
+    }
+  },
+
+  "required": [
+    "schemaVersion",
+    "run",
+    "source",
+    "measure",
+    "workflow",
+    "compute",
+    "artifacts",
+    "steps"
+  ],
+
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "1.0"
+    },
+
+    "run": {
+      "type": "object",
+      "required": [
+        "runId",
+        "runAttempt",
+        "createdUtc"
+      ],
+      "properties": {
+        "runId": {
+          "type": "string"
+        },
+        "runAttempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "createdUtc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "requestedBy": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+
+    "source": {
+      "type": "object",
+      "required": [
+        "repository",
+        "commitSha"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "branch": {
+          "type": ["string", "null"]
+        },
+        "commitSha": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40
+        }
+      }
+    },
+
+    "measure": {
+      "type": "object",
+      "required": [
+        "measurePath"
+      ],
+      "properties": {
+        "measurePath": {
+          "type": "string"
+        },
+        "measureId": {
+          "type": ["string", "null"]
+        },
+        "measureType": {
+          "type": "string",
+          "enum": [
+            "residential",
+            "commercial"
+          ]
+        }
+      }
+    },
+
+    "workflow": {
+      "type": "object",
+      "required": [
+        "workflowVersion",
+        "requestedSteps"
+      ],
+      "properties": {
+        "workflowVersion": {
+          "type": "string"
+        },
+
+        "composeOnly": {
+          "type": "boolean",
+          "default": false
+        },
+
+        "requestedSteps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "package-qc",
+              "compose",
+              "simulate",
+              "collect",
+              "postprocess",
+              "custom-hooks"
+            ]
+          }
+        }
+      }
+    },
+
+    "compute": {
+      "type": "object",
+      "required": [
+        "profile"
+      ],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": [
+            "test",
+            "standard",
+            "large"
+          ]
+        },
+        "instanceType": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+
+    "artifacts": {
+      "type": "object",
+      "required": [
+        "s3Bucket"
+      ],
+      "properties": {
+        "s3Bucket": {
+          "type": "string"
+        },
+        "s3Prefix": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+
+    "discovery": {
+      "type": "object",
+      "required": [
+        "scenarioCount",
+        "scenarios"
+      ],
+
+      "properties": {
+
+        "measureRoot": {
+          "type": "string"
+        },
+
+        "scenarioCount": {
+          "type": "integer"
+        },
+
+        "totalFiles": {
+          "type": "integer"
+        },
+
+        "totalBytes": {
+          "type": "integer"
+        },
+
+        "scenarios": {
+          "type": "array",
+
+          "items": {
+            "$ref": "#/$defs/scenario"
+          }
+        }
+      }
+    },
+
+    "steps": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/stepStatus"
+      }
+    }
+  }
+}

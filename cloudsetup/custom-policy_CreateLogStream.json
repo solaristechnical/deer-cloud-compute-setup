@@ -1,0 +1,26 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "VisualEditor0",
+            "Effect": "Allow",
+            "Action": [
+                "logs:DescribeLogGroups"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "VisualEditor1",
+            "Effect": "Allow",
+            "Action": [
+                "logs:DescribeLogStreams",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": [
+                "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${CLOUDWATCH_LOG_GROUP}",
+                "arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${CLOUDWATCH_LOG_GROUP}:log-stream:*"
+            ]
+        }
+    ]
+}

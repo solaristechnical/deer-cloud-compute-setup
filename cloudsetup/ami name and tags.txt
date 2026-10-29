@@ -1,0 +1,24 @@
+deer-simulation-runner-2026-09-24
+
+DEER simulation runner built on 2026-09-24
+
+Purpose
+Run DEER Simulations
+
+EnergyPlus
+9.5.0 and 22.2.0
+
+Environment
+Production
+
+Name
+deer-simulation-runner-2026-09-23
+
+Modelkit	
+0.9.3 Caboodle
+
+aws-cli
+2.37.2
+
+conda
+25.11.1

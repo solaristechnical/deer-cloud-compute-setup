@@ -1,0 +1,17 @@
+{
+  "toolVersions": {},
+  "inputFiles": [],
+  "externalInputs": [],
+  "energyPlusVersion": "",
+  "simulationManifest": {},
+  "stepStatuses": {},
+  "customHooks": [],
+  "securityContext": {},
+  "retentionPolicy": {},
+  "costTracking": {},
+  "detectedTemplateFiles": [],
+  "detectedWeatherFiles": [],
+  "detectedExternalInputs": [],
+  "composeEstimate": {},
+  "simulationEstimate": {}
+}

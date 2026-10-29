@@ -1,0 +1,58 @@
+name: Run DEER simulations
+
+run-name: >-
+  Run by @${{ github.actor }} from ${{ inputs.model_repo }}@${{ inputs.model_ref }}
+  in ${{ inputs.measure_path }}
+  using ${{ inputs.run_profile }} compute profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_repo:
+        description: "Repository containing the model"
+        required: true
+        type: choice
+        default: solaristechnical/DEER-Prototypes-EnergyPlus
+        options:
+          - solaristechnical/DEER-Prototypes-EnergyPlus
+      model_ref:
+        description: Git branch, tag, or SHA
+        required: true
+        type: string
+      measure_path:
+        description: "Repository-relative path to the measure folder"
+        required: true
+        type: string
+      run_profile:
+        description: "Requested compute profile"
+        required: true
+        type: choice
+        options:
+          - test
+          - standard
+          - large
+      simulate:
+        description: "Simulate models after compose"
+        required: false
+        type: boolean
+        default: false
+      keep_running: {description: "Do not stop instances after run",  type: boolean, default: false}
+      keep_instance: {description: "Do not terminate instance after run",  type: boolean, default: false}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  run:
+    uses: solaristechnical/deer-cloud-compute-setup/.github/workflows/deer_simulations.yml@main
+    secrets:
+      WORKFLOW_REPOSITORY_TOKEN: ${{ secrets.WORKFLOW_REPOSITORY_TOKEN }}
+    with:
+      model_repo: ${{ inputs.model_repo }}
+      model_ref: ${{ inputs.model_ref }}
+      measure_path: ${{ inputs.measure_path }}
+      run_profile: ${{ inputs.run_profile }}
+      simulate: ${{ inputs.simulate }}
+      keep_running: ${{ inputs.keep_running }}
+      keep_instance: ${{ inputs.keep_instance }}

@@ -1,0 +1,764 @@
+name: Run DEER simulations (backend)
+
+on:
+  workflow_call:
+    inputs:
+      model_repo:
+        description: "Repository containing the model"
+        required: true
+        type: string
+      model_ref:
+        description: Git branch, tag, or SHA
+        required: true
+        type: string
+      measure_path:
+        description: "Repository-relative path to the measure folder"
+        required: true
+        type: string
+      run_profile:
+        description: "Requested compute profile"
+        required: true
+        type: string
+      simulate:
+        description: "Simulate models after compose"
+        required: false
+        type: boolean
+        default: false
+      keep_running: {description: "Do not stop instances after run",  type: boolean, default: false}
+      keep_instance: {description: "Do not terminate instance after run",  type: boolean, default: false}
+    secrets:
+      WORKFLOW_REPOSITORY_TOKEN:
+        description: "Token with Contents: Read-only access to the workflow repository"
+        required: false
+
+concurrency:
+  group: ec2-server5
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  start-cloud:
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    outputs:
+      workflow_package_s3_key: ${{ steps.workflowPackage.outputs.s3_key }}
+      workflow_commit_sha: ${{ steps.workflowPackage.outputs.commit_sha }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_SIMULATION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # The workflow package is frozen on the first attempt; re-run attempts reuse the stored reference.
+      - name: Check for frozen workflow package
+        id: frozen
+        shell: bash
+        run: |
+          if aws s3 cp \
+            "s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}/workflow-package.json" \
+            workflow-package.json --only-show-errors 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out deer-cloud-compute-setup
+        if: steps.frozen.outputs.exists != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WORKFLOW_REPOSITORY }}
+          ref: ${{ vars.WORKFLOW_REF || 'main' }}
+          token: ${{ secrets.WORKFLOW_REPOSITORY_TOKEN || github.token }}
+          path: workflow_repo
+          persist-credentials: false
+
+      - name: Bundle and upload workflow package
+        if: steps.frozen.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git -C workflow_repo rev-parse HEAD)
+          KEY="githubactions/${{ github.run_id }}/workflow-package/deer-cloud-compute-setup-${SHA}.zip"
+          git -C workflow_repo archive --format=zip \
+            --add-virtual-file="WORKFLOW_COMMIT:${SHA}" \
+            --output="$PWD/workflow-package.zip" HEAD
+          VERSION_ID=$(aws s3api put-object \
+            --bucket "${{ vars.SIMULATION_BUCKET }}" \
+            --key "$KEY" \
+            --body workflow-package.zip \
+            --query VersionId --output text)
+          jq -n \
+            --arg repository "${{ vars.WORKFLOW_REPOSITORY }}" \
+            --arg ref "${{ vars.WORKFLOW_REF || 'main' }}" \
+            --arg commitSha "$SHA" \
+            --arg s3Key "$KEY" \
+            --arg s3VersionId "$VERSION_ID" \
+            --arg createdUtc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg runAttempt "${{ github.run_attempt }}" \
+            '{repository:$repository, ref:$ref, commitSha:$commitSha, s3Key:$s3Key,
+              s3VersionId:(if $s3VersionId == "None" then null else $s3VersionId end),
+              createdUtc:$createdUtc, createdByAttempt:($runAttempt|tonumber)}' \
+            > workflow-package.json
+          aws s3 cp workflow-package.json \
+            "s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}/workflow-package.json" \
+            --only-show-errors
+
+      - name: Read workflow package reference
+        id: workflowPackage
+        shell: bash
+        run: |
+          set -euo pipefail
+          S3_KEY=$(jq -r .s3Key workflow-package.json)
+          COMMIT_SHA=$(jq -r .commitSha workflow-package.json)
+          [[ "$S3_KEY" =~ ^githubactions/[A-Za-z0-9._/-]+\.zip$ ]]
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          echo "s3_key=$S3_KEY" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+      - name: Start simulation instance
+        run: |
+          aws ec2 start-instances \
+            --instance-ids "${{ vars.SIMULATION_INSTANCE_ID }}"
+
+          aws ec2 wait instance-running \
+            --instance-ids "${{ vars.SIMULATION_INSTANCE_ID }}"
+
+      - name: Wait for SSM ping
+        id: ssm
+        run: |
+          for attempt in {1..12}; do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=${{ vars.SIMULATION_INSTANCE_ID }}" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text)
+            echo "SSM status: $STATUS"
+            [[ "$STATUS" == "Online" ]] && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Cloud server startup summary" >> $GITHUB_STEP_SUMMARY
+          echo " - Simulation instance ID ${{ vars.SIMULATION_INSTANCE_ID }}"
+          echo " - SSM ping status ${{ steps.ssm.outcome }}"
+          echo "- Workflow package: \`${{ steps.workflowPackage.outputs.s3_key }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Workflow commit: ${{ steps.workflowPackage.outputs.commit_sha }}" >> $GITHUB_STEP_SUMMARY
+
+  package-qc:
+    needs: start-cloud
+    runs-on: ubuntu-latest
+    outputs:
+      s3bucket: s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}
+      start_date: ${{ steps.gitinfo.outputs.start_date }}
+      sha: ${{ steps.gitinfo.outputs.sha }}
+    steps:
+      # Checkout the model repository at the specified ref (branch, tag, or SHA)
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.model_repo }}
+          ref: ${{ inputs.model_ref }}
+          path: model_repo
+
+      - name: Capture commit SHA
+        id: gitinfo
+        shell: bash
+        run: |
+          cd model_repo
+          echo "start_date=$(date)" >> $GITHUB_OUTPUT
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Validate measure path
+        shell: bash
+        run: |
+          cd model_repo
+          test -d "${{ inputs.measure_path }}"
+          case "${{ inputs.measure_path }}" in
+            "commercial measures/"*|"residential measures/"*) ;;
+            *) echo "Invalid measure path"; exit 1 ;;
+          esac
+
+      - name: Check out frozen workflow actions
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WORKFLOW_REPOSITORY }}
+          ref: ${{ needs.start-cloud.outputs.workflow_commit_sha }}
+          token: ${{ secrets.WORKFLOW_REPOSITORY_TOKEN || github.token }}
+          path: workflow_repo
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        id: awsCredentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_SIMULATION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Run package QC on EC2
+        id: runDeer
+        uses: ./workflow_repo/.github/actions/run-deer-ec2
+        with:
+          instance-id: ${{ vars.SIMULATION_INSTANCE_ID }}
+          model-repo: ${{ inputs.model_repo }}
+          commit-sha: ${{ steps.gitinfo.outputs.sha }}
+          measure-path: ${{ inputs.measure_path }}
+          s3-bucket: ${{ vars.SIMULATION_BUCKET }}
+          requested-step: package-qc
+          workflow-package-s3-key: ${{ needs.start-cloud.outputs.workflow_package_s3_key }}
+
+      - name: Download QC artifacts from S3
+        id: downloadArtifacts
+        if: ${{ always() && steps.awsCredentials.outcome == 'success' && steps.runDeer.outputs.command_id != '' }}
+        shell: bash
+        run: |
+          download_optional() {
+            local source="$1"
+            local destination="$2"
+            local output_name="$3"
+            local base_s3_path="s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}"
+            mkdir -p "$(dirname "$destination")"
+            for attempt in {1..6}; do
+              if aws s3 cp "${base_s3_path}/${source}" "$destination" --only-show-errors && test -s "$destination"; then
+                echo "$output_name=true" >> "$GITHUB_OUTPUT"
+                return 0
+              fi
+              rm -f "$destination"
+              echo "Waiting for optional artifact: $source (attempt $attempt)..."
+              if [[ "$attempt" -lt 6 ]]; then sleep 5; fi
+            done
+            echo "::warning::Optional artifact is unavailable: $source"
+            echo "$output_name=false" >> "$GITHUB_OUTPUT"
+          }
+          download_optional "attempt-${{ github.run_attempt }}/transcript_package-qc.log" "transcript_package-qc.log" "transcript_available"
+          download_optional "outputs/package-qc/measure-qc.json" "outputs/measure-qc.json" "measure_qc_json_available"
+          download_optional "outputs/package-qc/measure-qc.md" "outputs/measure-qc.md" "measure_qc_md_available"
+          download_optional "outputs/package-qc/scenario-index.json" "outputs/scenario-index.json" "scenario_index_available"
+          download_optional "summary.md" "outputs/run-summary.md" "run_summary_available"
+
+      - name: Upload artifacts bundle
+        id: upload-artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-qc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            transcript_package-qc.log
+            step-status.json
+            outputs/*
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload measure-qc.json
+        id: upload-measure-qc-json
+        if: ${{ always() && hashFiles('outputs/measure-qc.json') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: measure-qc.json
+          path: outputs/measure-qc.json
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+      - name: Upload measure-qc.md
+        id: upload-measure-qc-md
+        if: ${{ always() && hashFiles('outputs/measure-qc.md') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: measure-qc.md
+          path: outputs/measure-qc.md
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+      - name: Upload scenario-index.json
+        id: upload-scenario-index-json
+        if: ${{ always() && hashFiles('outputs/scenario-index.json') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: scenario-index.json
+          path: outputs/scenario-index.json
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+      - name: Upload run summary
+        id: upload-run-summary
+        if: ${{ always() && hashFiles('outputs/run-summary.md') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: run-summary.md
+          path: outputs/run-summary.md
+          if-no-files-found: error
+          retention-days: 30
+          archive: false
+
+      - name: Add summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          SEND_COMMAND_OUTCOME: ${{ steps.runDeer.outputs.send_command_outcome }}
+          SSM_STATUS: ${{ steps.runDeer.outputs.ssm_status }}
+          SSM_STATUS_DETAILS: ${{ steps.runDeer.outputs.ssm_status_details }}
+          SSM_RESPONSE_CODE: ${{ steps.runDeer.outputs.ssm_response_code }}
+          STATUS_FILE_AVAILABLE: ${{ steps.runDeer.outputs.step_status_available }}
+          QC_STATUS: ${{ steps.runDeer.outputs.step_status }}
+          MEASURE_QC_JSON_URL: ${{ steps.upload-measure-qc-json.outputs.artifact-url }}
+          MEASURE_QC_MD_URL: ${{ steps.upload-measure-qc-md.outputs.artifact-url }}
+          SCENARIO_INDEX_URL: ${{ steps.upload-scenario-index-json.outputs.artifact-url }}
+          RUN_SUMMARY_URL: ${{ steps.upload-run-summary.outputs.artifact-url }}
+          ARTIFACT_BUNDLE_URL: ${{ steps.upload-artifacts.outputs.artifact-url }}
+        run: |
+          echo "## Package QC task status" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Send-command step: ${SEND_COMMAND_OUTCOME:-not run}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SSM status: ${SSM_STATUS:-unavailable}" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -n "${SSM_STATUS_DETAILS:-}" ]]; then
+            echo "- SSM details: $SSM_STATUS_DETAILS" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -n "${SSM_RESPONSE_CODE:-}" ]]; then
+            echo "- SSM response code: $SSM_RESPONSE_CODE" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "- Step status file available: ${STATUS_FILE_AVAILABLE:-false}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- QC status: ${QC_STATUS:-unavailable}" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -s step-status.json ]]; then
+            echo "- Runtime (seconds): $(jq -r '.DurationSeconds // \"unknown\"' step-status.json)" >> "$GITHUB_STEP_SUMMARY"
+            failure_message=$(jq -r '.FailureMessage // empty' step-status.json)
+            if [[ -n "$failure_message" ]]; then
+              echo "- Failure message: $failure_message" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### QC results" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -s outputs/measure-qc.md ]]; then
+            cat outputs/measure-qc.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "QC report was not available." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Workflow summary" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -s outputs/run-summary.md ]]; then
+            cat outputs/run-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Run summary was not available." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Downloads" >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "${MEASURE_QC_JSON_URL:-}" ]] && echo "- [measure-qc.json]($MEASURE_QC_JSON_URL)" >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "${MEASURE_QC_MD_URL:-}" ]] && echo "- [measure-qc.md]($MEASURE_QC_MD_URL)" >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "${SCENARIO_INDEX_URL:-}" ]] && echo "- [scenario-index.json]($SCENARIO_INDEX_URL)" >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "${RUN_SUMMARY_URL:-}" ]] && echo "- [run-summary.md]($RUN_SUMMARY_URL)" >> "$GITHUB_STEP_SUMMARY"
+          [[ -n "${ARTIFACT_BUNDLE_URL:-}" ]] && echo "- [Additional package-qc artifacts]($ARTIFACT_BUNDLE_URL)" >> "$GITHUB_STEP_SUMMARY"
+
+  compose:
+    needs: [start-cloud, package-qc]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out frozen workflow actions
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WORKFLOW_REPOSITORY }}
+          ref: ${{ needs.start-cloud.outputs.workflow_commit_sha }}
+          token: ${{ secrets.WORKFLOW_REPOSITORY_TOKEN || github.token }}
+          path: workflow_repo
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_SIMULATION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Compose models on EC2
+        id: runDeer
+        uses: ./workflow_repo/.github/actions/run-deer-ec2
+        with:
+          instance-id: ${{ vars.SIMULATION_INSTANCE_ID }}
+          model-repo: ${{ inputs.model_repo }}
+          commit-sha: ${{ needs.package-qc.outputs.sha }}
+          measure-path: ${{ inputs.measure_path }}
+          s3-bucket: ${{ vars.SIMULATION_BUCKET }}
+          requested-step: compose
+          workflow-package-s3-key: ${{ needs.start-cloud.outputs.workflow_package_s3_key }}
+          poll-interval-seconds: '30'
+
+      - name: Download artifacts from S3
+        id: download-artifacts
+        shell: bash
+        run: |
+          # Define a function to download required artifacts from S3 with retries
+          download_required() {
+            local source="$1"
+            local destination="$2"
+            local base_s3_path="s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}"
+            mkdir -p "$(dirname "$destination")"
+
+            for attempt in {1..10}; do
+              if aws s3 cp "${base_s3_path}/${source}" "$destination"; then
+                test -s "$destination" && return 0
+              fi
+              echo "Waiting for $(basename "$destination")..."
+              sleep 10
+            done
+
+            echo "::error::Required artifact was not available: $source"
+            return 1
+          }
+          # Download the transcript for this step
+          download_required \
+            "attempt-${{ github.run_attempt }}/transcript_compose.log" \
+            "transcript_compose.log"
+          # Download scenario-index.json from the package-qc step outputs
+          download_required \
+            "outputs/package-qc/scenario-index.json" \
+            "scenario-index.json"
+
+          # Iterate over scenarios from scenario index
+          # Scenario index is just an unnamed list of dictionaries, each element representing a scenario with element scenarioId
+          # scenarioId is a folder name that may include spaces.
+          while IFS= read -r scenario; do
+            echo "Fetching scenario: $scenario"
+            download_required \
+              "outputs/compose/${scenario}/compose.log" \
+              "outputs/compose/${scenario}/compose.log"
+          done < <(jq -r '.[].scenarioId' scenario-index.json)
+
+      - name: Upload artifacts to Github
+        id: upload-artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: compose-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            step-status.json
+            transcript_compose.log
+            outputs/compose/*/compose.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Add summary
+        shell: bash
+        run: |
+          STATUS=$(jq -r .Status step-status.json)
+          echo "## Compose task status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Runtime (seconds): $(jq -r .RunTimeSeconds step-status.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: $(jq -r .Status step-status.json)" >> $GITHUB_STEP_SUMMARY
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "- Failure message: $(jq -r .FailureMessage step-status.json)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Downloads" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [Compose logs](${{ steps.upload-artifacts.outputs.artifact-url }})" >> "$GITHUB_STEP_SUMMARY"
+
+  compose-qc:
+    needs: [start-cloud, package-qc, compose]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out frozen workflow actions
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WORKFLOW_REPOSITORY }}
+          ref: ${{ needs.start-cloud.outputs.workflow_commit_sha }}
+          token: ${{ secrets.WORKFLOW_REPOSITORY_TOKEN || github.token }}
+          path: workflow_repo
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_SIMULATION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Run compose QC on EC2
+        id: runDeer
+        uses: ./workflow_repo/.github/actions/run-deer-ec2
+        with:
+          instance-id: ${{ vars.SIMULATION_INSTANCE_ID }}
+          model-repo: ${{ inputs.model_repo }}
+          commit-sha: ${{ needs.package-qc.outputs.sha }}
+          measure-path: ${{ inputs.measure_path }}
+          s3-bucket: ${{ vars.SIMULATION_BUCKET }}
+          requested-step: compose-qc
+          workflow-package-s3-key: ${{ needs.start-cloud.outputs.workflow_package_s3_key }}
+          poll-interval-seconds: '30'
+
+      - name: Download artifacts from S3
+        id: download-artifacts
+        shell: bash
+        run: |
+          # Define a function to download required artifacts from S3 with retries
+          download_required() {
+            local base_s3_path="s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}"
+            local source="$1"
+            local destination="$2"
+            mkdir -p "$(dirname "$destination")"
+
+            for attempt in {1..10}; do  
+              if aws s3 cp "${base_s3_path}/${source}" "$destination"; then
+                test -s "$destination" && return 0
+              fi
+              echo "Waiting for $(basename "$destination")..."
+              sleep 10
+            done
+
+            echo "::error::Required artifact was not available: $source"
+            return 1
+          }
+          
+          # Download transcript and compose-qc outputs for each scenario
+          download_required "attempt-${{ github.run_attempt }}/transcript_compose-qc.log" "transcript_compose-qc.log"
+          download_required "outputs/compose-qc/composeQc.json" "outputs/compose-qc/composeQc.json"
+
+      - name: Upload artifacts to Github
+        id: upload-artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: compose-qc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            step-status.json
+            transcript_compose-qc.log
+            outputs/compose-qc/composeQc.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Add summary
+        shell: bash
+        run: |
+          STATUS=$(jq -r .Status step-status.json)
+          echo "## Compose QC task status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Runtime (seconds): $(jq -r .RunTimeSeconds step-status.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: $(jq -r .Status step-status.json)" >> $GITHUB_STEP_SUMMARY
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "- Failure message: $(jq -r .FailureMessage step-status.json)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Downloads" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [Compose QC results](${{ steps.upload-artifacts.outputs.artifact-url }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Included file: \`composeQc.json\`" >> "$GITHUB_STEP_SUMMARY"
+
+  simulate:
+    needs: [start-cloud, package-qc, compose-qc]
+    if: ${{ inputs.simulate == true }}
+    # Note that a single-CPU runner is NOT compatible with this step due to a hard limit of 15 minutes per job.
+    # See: https://docs.github.com/en/actions/reference/runners/github-hosted-runners#single-cpu-runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check out frozen workflow actions
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ vars.WORKFLOW_REPOSITORY }}
+          ref: ${{ needs.start-cloud.outputs.workflow_commit_sha }}
+          token: ${{ secrets.WORKFLOW_REPOSITORY_TOKEN || github.token }}
+          path: workflow_repo
+          persist-credentials: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_SIMULATION_ROLE_ARN }}
+          aws-region: us-east-1
+          # Keep credentials alive long enough for simulations to complete.
+          # Otherwise, aws may throw ExpiredTokenException
+          # Default role duration is 1 hour (3600 seconds), good enough except for simulation run.
+          # Maximum for this role is configured in AWS, try 4 hours (14400 seconds) if needed.
+          role-duration-seconds: 14400
+
+      - name: Select instance type
+        id: instanceType
+        shell: bash
+        run: |
+          # If no matching run_profile is found, default to standard
+          instance_type="${{ vars.EC2_INSTANCE_TYPE_STANDARD }}"
+          case "${{ inputs.run_profile }}" in
+            test) instance_type="${{ vars.EC2_INSTANCE_TYPE_TEST }}" ;;
+            standard) instance_type="${{ vars.EC2_INSTANCE_TYPE_STANDARD }}" ;;
+            large) instance_type="${{ vars.EC2_INSTANCE_TYPE_LARGE }}" ;;
+          esac
+          test -n "$instance_type"
+          echo "instance_type=$instance_type" >> "$GITHUB_OUTPUT"
+
+      - name: Launch ephemeral simulation instance
+        id: launch
+        shell: bash
+        env:
+          MODEL_REPO: ${{ inputs.model_repo }}
+          MODEL_REF: ${{ inputs.model_ref }}
+          MEASURE_PATH: ${{ inputs.measure_path }}
+        run: |
+          TAG_SPECIFICATIONS=$(jq -nc \
+            --arg runId "${{ github.run_id }}" \
+            --arg runAttempt "${{ github.run_attempt }}" \
+            --arg modelRepo "$MODEL_REPO" \
+            --arg branch "$MODEL_REF" \
+            --arg measurePath "$MEASURE_PATH" \
+            '[{ResourceType:"instance",Tags:[
+              {Key:"Name",Value:("deer_runner_" + $runId)},
+              {Key:"Application",Value:"DEER simulations"},
+              {Key:"GitHubRunId",Value:$runId},
+              {Key:"GitHubRunAttempt",Value:$runAttempt},
+              {Key:"Repository",Value:$modelRepo},
+              {Key:"Branch",Value:$branch},
+              {Key:"MeasurePath",Value:$measurePath},
+              {Key:"ManagedBy",Value:"GitHubActions"},
+              {Key:"Workload",Value:"RunDeerSimulations"}
+            ]}]')
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --launch-template "LaunchTemplateId=${{ vars.EC2_LAUNCH_TEMPLATE_ID }},Version=${{ vars.EC2_LAUNCH_TEMPLATE_VERSION }}" \
+            --instance-type "${{ steps.instanceType.outputs.instance_type }}" \
+            --client-token "deer-${{ github.run_id }}-${{ github.run_attempt }}-simulate" \
+            --tag-specifications "$TAG_SPECIFICATIONS" \
+            --query 'Instances[0].InstanceId' --output text)
+          test -n "$INSTANCE_ID" && test "$INSTANCE_ID" != None
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "- Simulation instance ID: $INSTANCE_ID" >> "$GITHUB_STEP_SUMMARY"
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+
+      - name: Wait for SSM
+        shell: bash
+        run: |
+          INSTANCE_ID="${{ steps.launch.outputs.instance_id }}"
+          for attempt in {1..40}; do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+              --query 'InstanceInformationList[0].PingStatus' \
+              --output text)
+            echo "SSM status: $STATUS"
+            [[ "$STATUS" == "Online" ]] && exit 0
+            sleep 15
+          done
+          exit 1
+
+      - name: Simulate models on EC2
+        id: runDeer
+        uses: ./workflow_repo/.github/actions/run-deer-ec2
+        with:
+          instance-id: ${{ steps.launch.outputs.instance_id }}
+          model-repo: ${{ inputs.model_repo }}
+          commit-sha: ${{ needs.package-qc.outputs.sha }}
+          measure-path: ${{ inputs.measure_path }}
+          s3-bucket: ${{ vars.SIMULATION_BUCKET }}
+          requested-step: simulate
+          workflow-package-s3-key: ${{ needs.start-cloud.outputs.workflow_package_s3_key }}
+          poll-attempts: '240'
+          poll-interval-seconds: '60'
+
+      - name: Download artifacts from S3
+        id: download-artifacts
+        shell: bash
+        run: |
+          # Define a function to download required artifacts from S3 with retries
+          download_required() {
+            local base_s3_path="s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}"
+            local source="$1"
+            local destination="$2"
+            mkdir -p "$(dirname "$destination")"
+
+            for attempt in {1..10}; do  
+              if aws s3 cp "${base_s3_path}/${source}" "$destination"; then
+                test -s "$destination" && return 0
+              fi
+              echo "Waiting for $(basename "$destination")..."
+              sleep 10
+            done
+
+            echo "::error::Required artifact was not available: $source"
+            return 1
+          }
+          # Download scenario-index.json from the package-qc step outputs
+          download_required "outputs/package-qc/scenario-index.json" "scenario-index.json"
+
+          # Download transcript and simulate outputs for each scenario
+          download_required "attempt-${{ github.run_attempt }}/transcript_simulate.log" "transcript_simulate.log"
+
+          # Iterate over scenarios from scenario index
+          # Scenario index is just an unnamed list of dictionaries, each element representing a scenario with element scenarioId
+          # scenarioId is a folder name that may include spaces.
+          while IFS= read -r scenario; do
+            echo "Processing scenario: $scenario"
+            download_required "outputs/simulate/${scenario}/simulate.log" "outputs/simulate/${scenario}/simulate.log"
+          done < <(jq -r '.[].scenarioId' scenario-index.json)
+
+      - name: Upload artifacts
+        id: upload-artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: simulate-${{ github.run_id }}-${{github.run_attempt}}
+          path: |
+            step-status.json
+            transcript_simulate.log
+            outputs/simulate/*/simulate.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Add summary
+        shell: bash
+        run: |
+          STATUS=$(jq -r .Status step-status.json)
+          echo "## Simulation task status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Runtime (seconds): $(jq -r .RunTimeSeconds step-status.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: $(jq -r .Status step-status.json)" >> $GITHUB_STEP_SUMMARY
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "- Failure message: $(jq -r .FailureMessage step-status.json)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Downloads" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- [Simulation results](${{ steps.upload-artifacts.outputs.artifact-url }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Included file: \`transcript_simulate.log\` and \`outputs/simulate*.log\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop ephemeral simulation instance
+        if: ${{ always() && steps.launch.outputs.instance_id != '' && !inputs.keep_running }}
+        shell: bash
+        run: |
+          aws ec2 stop-instances --instance-ids "${{ steps.launch.outputs.instance_id }}"
+          aws ec2 wait instance-stopped --instance-ids "${{ steps.launch.outputs.instance_id }}"
+
+      - name: Terminate ephemeral simulation instance
+        if: ${{ always() && steps.launch.outputs.instance_id != '' && !inputs.keep_instance }}
+        shell: bash
+        run: |
+          aws ec2 terminate-instances --instance-ids "${{ steps.launch.outputs.instance_id }}"
+          aws ec2 wait instance-terminated --instance-ids "${{ steps.launch.outputs.instance_id }}"
+
+  collect:
+    needs: simulate
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Hello world!"
+
+  calculate:
+    needs: collect
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Hello world!"
+
+  # This final job runs regardless of the success or failure of job1 and job2
+  stop-cloud:
+    needs: [calculate]
+    if: ${{ always() && !inputs.keep_running }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_SIMULATION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Stop simulation instance
+        run: |
+          aws ec2 stop-instances \
+            --instance-ids "${{ vars.SIMULATION_INSTANCE_ID }}"

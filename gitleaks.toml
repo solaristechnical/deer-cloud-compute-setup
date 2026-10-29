@@ -1,0 +1,47 @@
+# gitleaks.toml - configuration file for automated secrets scan
+
+# Extend Gitleaks' built-in credential rules with value-agnostic AWS identifier patterns.
+title = "DEER repository secrets and AWS identifier checks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "aws-account-id-in-arn"
+description = "AWS account ID embedded in an ARN"
+regex = '''(arn:aws[a-z0-9-]*:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:[^\s"']+)'''
+secretGroup = 1
+keywords = ["arn:aws"]
+tags = ["aws", "account-id"]
+
+[[rules]]
+id = "aws-account-id-field"
+description = "AWS account ID in an account or owner field"
+regex = '''(?i)(account|account[_-]?id|owner[_-]?id|aws[_-]?account[_-]?id)[\s"'=:]+([0-9]{12})\b'''
+secretGroup = 2
+keywords = ["account", "Account", "ACCOUNT", "ownerId", "OwnerId", "OwnerID", "OWNERID"]
+tags = ["aws", "account-id"]
+
+[[rules]]
+id = "aws-resource-id"
+description = "AWS resource identifier with a known resource prefix"
+regex = '''\b((i|ami|lt|sg|subnet|vpc|vol|snap|eni|eipalloc|eipassoc|rtb|igw|nat|vpce|acl|vpn|pcx|cgw|vgw|tgw|tgw-attach|vpc-ep|fs|fsmt|fsap|db|cluster|rds|cache)-[0-9a-f]{8,32})\b'''
+secretGroup = 1
+keywords = ["i-", "ami-", "lt-", "sg-", "subnet-", "vpc-", "vol-", "snap-", "eni-", "eipalloc-", "rtb-", "igw-", "nat-", "vpce-", "acl-", "vpn-", "pcx-", "cgw-", "vgw-", "tgw-"]
+tags = ["aws", "resource-id"]
+
+[[rules]]
+id = "aws-iam-unique-id"
+description = "AWS IAM unique role, user, group, profile, or policy identifier"
+regex = '''\b((AROA|AIDA|AGPA|AIPA|ANPA)[A-Z0-9]{16,20})\b'''
+secretGroup = 1
+keywords = ["AROA", "AIDA", "AGPA", "AIPA", "ANPA"]
+tags = ["aws", "resource-id"]
+
+[[rules]]
+id = "aws-s3-bucket-arn"
+description = "Concrete S3 bucket name in an ARN"
+regex = '''(arn:aws[a-z0-9-]*:s3:::[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](/[^\s"']*)?)'''
+secretGroup = 1
+keywords = ["arn:aws:s3:::", "arn:aws-cn:s3:::", "arn:aws-us-gov:s3:::"]
+tags = ["aws", "resource-id"]

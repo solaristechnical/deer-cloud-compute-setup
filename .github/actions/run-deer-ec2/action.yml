@@ -1,0 +1,223 @@
+name: Run DEER step on EC2
+description: Submit a DEER step through SSM, wait for completion, and validate its S3 status.
+
+inputs:
+  instance-id:
+    description: EC2 instance managed by SSM.
+    required: true
+  model-repo:
+    description: Repository containing the model.
+    required: true
+  commit-sha:
+    description: Frozen model commit SHA.
+    required: true
+  measure-path:
+    description: Repository-relative measure directory.
+    required: true
+  s3-bucket:
+    description: Simulation bucket name, without the s3 prefix.
+    required: true
+  requested-step:
+    description: DEER step to execute (package-qc, compose, compose-qc, or simulate).
+    required: true
+  workflow-package-s3-key:
+    description: S3 key of the frozen workflow package.
+    required: true
+  poll-attempts:
+    description: Maximum number of SSM invocation queries.
+    default: '120'
+  poll-interval-seconds:
+    description: Delay between SSM invocation queries.
+    default: '15'
+
+outputs:
+  command_id:
+    description: Submitted SSM command ID, if available.
+    value: ${{ steps.sendCommand.outputs.command_id }}
+  send_command_outcome:
+    description: Outcome of the SSM submission step.
+    value: ${{ steps.sendCommand.outcome }}
+  ssm_status:
+    description: Last observed SSM invocation status.
+    value: ${{ steps.waitForCommand.outputs.ssm_status }}
+  ssm_status_details:
+    description: SSM status details or polling deadline explanation.
+    value: ${{ steps.waitForCommand.outputs.ssm_status_details }}
+  ssm_response_code:
+    description: Last observed SSM response code.
+    value: ${{ steps.waitForCommand.outputs.ssm_response_code }}
+  step_status_available:
+    description: Whether a valid step-status.json was downloaded to the workspace.
+    value: ${{ steps.downloadStatus.outputs.step_status_available }}
+  step_status:
+    description: Status reported by DEER in step-status.json.
+    value: ${{ steps.downloadStatus.outputs.step_status }}
+
+runs:
+  using: composite
+  steps:
+    - name: Send SSM command
+      id: sendCommand
+      shell: bash
+      env:
+        INSTANCE_ID: ${{ inputs.instance-id }}
+        MODEL_REPO: ${{ inputs.model-repo }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        MEASURE_PATH: ${{ inputs.measure-path }}
+        S3_BUCKET: ${{ inputs.s3-bucket }}
+        DEER_STEP: ${{ inputs.requested-step }}
+        WORKFLOW_PACKAGE_S3_KEY: ${{ inputs.workflow-package-s3-key }}
+      run: |
+        set -euo pipefail
+        # Escape PowerShell string literals independently of the runner's shell.
+        ps_quote() {
+          local value="${1//\'/\'\'}"
+          printf "'%s'" "$value"
+        }
+        COMMAND="pwsh 'C:/DEER/deer-cloud-compute-setup/workflow/BootstrapSimulation.ps1'"
+        COMMAND+=" -RunId $(ps_quote "$GITHUB_RUN_ID")"
+        COMMAND+=" -Repository $(ps_quote "$MODEL_REPO")"
+        COMMAND+=" -CommitSha $(ps_quote "$COMMIT_SHA")"
+        COMMAND+=" -MeasurePath $(ps_quote "$MEASURE_PATH")"
+        COMMAND+=" -S3Bucket $(ps_quote "$S3_BUCKET")"
+        COMMAND+=" -RunAttempt $(ps_quote "$GITHUB_RUN_ATTEMPT")"
+        COMMAND+=" -RequestedSteps $(ps_quote "$DEER_STEP")"
+        COMMAND+=" -WorkflowPackageS3Key $(ps_quote "$WORKFLOW_PACKAGE_S3_KEY")"
+        echo "COMMAND=$COMMAND"
+        PARAMS=$(jq -nc --arg command "$COMMAND" '{commands:[$command]}')
+        COMMAND_ID=$(aws ssm send-command \
+          --instance-ids "$INSTANCE_ID" \
+          --document-name "AWS-RunPowerShellScript" \
+          --parameters "$PARAMS" \
+          --timeout-seconds 3600 \
+          --cloud-watch-output-config CloudWatchOutputEnabled=true,CloudWatchLogGroupName="/aws/ssm/githubactions" \
+          --comment "DEER:$GITHUB_RUN_ID:$DEER_STEP" \
+          --query 'Command.CommandId' \
+          --output text)
+        if [[ -z "$COMMAND_ID" || "$COMMAND_ID" == "None" ]]; then
+          echo "::error::SSM did not return a command ID."
+          exit 1
+        fi
+        echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+        {
+          echo "## $DEER_STEP task submitted"
+          echo "- Run ID: $GITHUB_RUN_ID"
+          echo "- Repository: $MODEL_REPO"
+          echo "- Commit SHA: $COMMIT_SHA"
+          echo "- Measure path: $MEASURE_PATH"
+          echo "- SSM Command ID: $COMMAND_ID"
+          echo "- S3 archive: \`s3://$S3_BUCKET/githubactions/$GITHUB_RUN_ID\`"
+          echo "- Log file: s3://$S3_BUCKET/githubactions/$GITHUB_RUN_ID/attempt-$GITHUB_RUN_ATTEMPT/transcript_$DEER_STEP.log"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Poll SSM command
+      id: waitForCommand
+      if: ${{ always() }}
+      shell: bash
+      env:
+        INSTANCE_ID: ${{ inputs.instance-id }}
+        COMMAND_ID: ${{ steps.sendCommand.outputs.command_id }}
+        POLL_ATTEMPTS: ${{ inputs.poll-attempts }}
+        POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$POLL_ATTEMPTS" =~ ^[1-9][0-9]*$ || ! "$POLL_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+          echo "::error::Polling attempts and interval must be positive integers."
+          exit 1
+        fi
+        SSM_STATUS="NotSubmitted"
+        STATUS_DETAILS="No SSM command ID was created."
+        RESPONSE_CODE=""
+        if [[ -n "$COMMAND_ID" ]]; then
+          SSM_STATUS="Unknown"
+          STATUS_DETAILS="No invocation response was received."
+          for ((attempt=1; attempt<=POLL_ATTEMPTS; attempt++)); do
+            if INVOCATION=$(aws ssm get-command-invocation \
+              --instance-id "$INSTANCE_ID" \
+              --command-id "$COMMAND_ID" \
+              --output json); then
+              SSM_STATUS=$(jq -r '.Status // "Unknown"' <<< "$INVOCATION")
+              STATUS_DETAILS=$(jq -r '.StatusDetails // "Unknown"' <<< "$INVOCATION")
+              RESPONSE_CODE=$(jq -r '.ResponseCode // "Unknown"' <<< "$INVOCATION")
+              echo "SSM status: $SSM_STATUS ($STATUS_DETAILS)"
+              case "$SSM_STATUS" in
+                Pending|InProgress|Delayed|Cancelling) ;;
+                *) break ;;
+              esac
+            else
+              echo "SSM invocation is not available yet (attempt $attempt)."
+            fi
+            if [[ "$attempt" -lt "$POLL_ATTEMPTS" ]]; then sleep "$POLL_INTERVAL_SECONDS"; fi
+          done
+          case "$SSM_STATUS" in
+            Pending|InProgress|Delayed|Cancelling|Unknown)
+              STATUS_DETAILS="Polling deadline reached; last observed status: $SSM_STATUS."
+              ;;
+          esac
+        fi
+        {
+          echo "ssm_status=$SSM_STATUS"
+          echo "ssm_status_details=$STATUS_DETAILS"
+          echo "ssm_response_code=$RESPONSE_CODE"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Retrieve step-status.json
+      id: downloadStatus
+      if: ${{ always() && steps.sendCommand.outputs.command_id != '' }}
+      shell: bash
+      env:
+        S3_BUCKET: ${{ inputs.s3-bucket }}
+        DEER_STEP: ${{ inputs.requested-step }}
+      run: |
+        set -euo pipefail
+        STATUS_FILE_AVAILABLE=false
+        STEP_STATUS="Unavailable"
+        STATUS_PATH="s3://$S3_BUCKET/githubactions/$GITHUB_RUN_ID/steps/$DEER_STEP/step-status.json"
+        for attempt in {1..10}; do
+          if aws s3 cp "$STATUS_PATH" step-status.json --only-show-errors && \
+            test -s step-status.json && \
+            jq -e 'type == "object" and (.Status | type == "string")' step-status.json >/dev/null; then
+            STATUS_FILE_AVAILABLE=true
+            STEP_STATUS=$(jq -r '.Status' step-status.json)
+            break
+          fi
+          rm -f step-status.json
+          echo "Waiting for a valid step-status.json (attempt $attempt)..."
+          if [[ "$attempt" -lt 10 ]]; then sleep 5; fi
+        done
+        if [[ "$STATUS_FILE_AVAILABLE" != true ]]; then
+          echo "::warning::A valid $DEER_STEP step-status.json was not available."
+        fi
+        echo "step_status_available=$STATUS_FILE_AVAILABLE" >> "$GITHUB_OUTPUT"
+        echo "step_status=$STEP_STATUS" >> "$GITHUB_OUTPUT"
+
+    - name: Validate DEER step status
+      if: ${{ always() }}
+      shell: bash
+      env:
+        DEER_STEP: ${{ inputs.requested-step }}
+        SEND_COMMAND_OUTCOME: ${{ steps.sendCommand.outcome }}
+        WAIT_OUTCOME: ${{ steps.waitForCommand.outcome }}
+        SSM_STATUS: ${{ steps.waitForCommand.outputs.ssm_status }}
+        STATUS_FILE_AVAILABLE: ${{ steps.downloadStatus.outputs.step_status_available }}
+        STEP_STATUS: ${{ steps.downloadStatus.outputs.step_status }}
+      run: |
+        set -euo pipefail
+        FAILED=false
+        if [[ "$SEND_COMMAND_OUTCOME" != "success" ]]; then
+          echo "::error::The SSM command was not submitted successfully."
+          FAILED=true
+        fi
+        if [[ "$WAIT_OUTCOME" != "success" || "$SSM_STATUS" != "Success" ]]; then
+          echo "::error::SSM did not complete successfully (status: ${SSM_STATUS:-unavailable})."
+          FAILED=true
+        fi
+        if [[ "$STATUS_FILE_AVAILABLE" != "true" ]]; then
+          echo "::error::A valid $DEER_STEP step-status.json was not downloaded."
+          FAILED=true
+        fi
+        if [[ "$STEP_STATUS" != "Success" ]]; then
+          echo "::error::$DEER_STEP did not succeed (status: ${STEP_STATUS:-unavailable})."
+          FAILED=true
+        fi
+        if [[ "$FAILED" == true ]]; then exit 1; fi

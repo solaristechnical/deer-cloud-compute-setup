@@ -1,0 +1,38 @@
+name: Deploy main to server5
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ec2-server5
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      DEPLOY_BUCKET: ${{ vars.DEPLOY_BUCKET }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: deploy-server5-${{ github.run_id }}
+
+      - name: Upload and deploy repository
+        shell: pwsh
+        run: |
+          ./cloudsetup/deploy-server5.ps1 -AwsRegion $env:AWS_REGION -DeployBucket $env:DEPLOY_BUCKET

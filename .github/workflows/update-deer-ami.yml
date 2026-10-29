@@ -1,0 +1,80 @@
+name: Update DEER AMI and launch template
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: update-deer-ami
+  cancel-in-progress: false
+
+jobs:
+  update-ami:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      launch-template-version: ${{ steps.update-template.outputs.version-number }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AMI_SOURCE_INSTANCE_ID: ${{ vars.AMI_SOURCE_INSTANCE_ID }}
+      EC2_LAUNCH_TEMPLATE_ID: ${{ vars.EC2_LAUNCH_TEMPLATE_ID }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Authenticate to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: update-deer-ami-${{ github.run_id }}
+
+      - name: Create AMI
+        id: create-ami
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:AMI_SOURCE_INSTANCE_ID)) {
+            throw 'Set the repository Actions variable AMI_SOURCE_INSTANCE_ID to the source EC2 instance ID.'
+          }
+
+          $imageId = ./cloudsetup/create-ami.ps1 -InstanceId $env:AMI_SOURCE_INSTANCE_ID
+          if ([string]::IsNullOrWhiteSpace($imageId)) {
+            throw 'The AMI script did not return an image ID.'
+          }
+
+          "image-id=$imageId" >> $env:GITHUB_OUTPUT
+          Write-Host "Created AMI: $imageId"
+
+      - name: Wait for AMI availability
+        shell: pwsh
+        env:
+          IMAGE_ID: ${{ steps.create-ami.outputs.image-id }}
+        run: aws ec2 wait image-available --image-ids $env:IMAGE_ID
+
+      - name: Create launch-template version
+        id: update-template
+        shell: pwsh
+        env:
+          IMAGE_ID: ${{ steps.create-ami.outputs.image-id }}
+        run: |
+          $response = ./cloudsetup/create-launch-template-version.ps1 -ImageId $env:IMAGE_ID -LaunchTemplateId $env:EC2_LAUNCH_TEMPLATE_ID | ConvertFrom-Json
+          $versionNumber = $response.LaunchTemplateVersion.VersionNumber
+          if ($null -eq $versionNumber) {
+            throw 'AWS did not return a launch-template version number.'
+          }
+
+          "version-number=$versionNumber" >> $env:GITHUB_OUTPUT
+          @"
+          ## Launch template updated
+
+          - Launch template: ``$env:EC2_LAUNCH_TEMPLATE_ID``
+          - Version: ``$versionNumber``
+          - AMI: ``$env:IMAGE_ID``
+          "@ >> $env:GITHUB_STEP_SUMMARY
+          Write-Host "Created launch-template version $versionNumber"
