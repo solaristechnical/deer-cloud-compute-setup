@@ -2,7 +2,9 @@
 set -euo pipefail
 
 # Requires Bash, jq, and mikefarah/yq v4. The AWS CLI is mocked; no credentials or network access are used.
+# Testing locally on Windows, use WSL or Docker for Bash.
 # Keep this file LF-terminated; Windows core.autocrlf=true can make Bash reject it in WSL or Docker.
+
 action_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
@@ -19,7 +21,7 @@ export GITHUB_RUN_ID=123
 export GITHUB_RUN_ATTEMPT=2
 export MODEL_REPO="solaristechnical/DEER-Prototypes-EnergyPlus"
 export COMMIT_SHA=64daae4514c08c7d93da60561c0f6384a464c300
-export MEASURE_PATH="residential measures/SWHC030-03 Whole House Fan"
+export MEASURE_PATH="commercial measures/Bob's \$(printf unsafe)"
 export S3_BUCKET=test-bucket
 export WORKFLOW_PACKAGE_S3_KEY=githubactions/123/workflow.zip
 export SCENARIO_ID="SWHC030-03 Whole House Fan_SFm_1975"
