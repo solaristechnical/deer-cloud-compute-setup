@@ -1,20 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Requires bash, jq, and mikefarah/yq v4. No AWS credentials or network access are used.
+# Requires Bash, jq, and mikefarah/yq v4. The AWS CLI is mocked; no credentials or network access are used.
+# Testing locally on Windows, use WSL or Docker for Bash.
+# Keep this file LF-terminated; Windows core.autocrlf=true can make Bash reject it in WSL or Docker.
+
 action_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
+# Extract each action's inline script so the harness tests the real step bodies.
+# Assumption to verify if action.yml changes: the four run blocks remain steps 0-3.
 for index in 0 1 2 3; do
   yq -r ".runs.steps[$index].run" "$action_dir/action.yml" > "$test_dir/step-$index.sh"
   bash -n "$test_dir/step-$index.sh"
 done
 
-export INSTANCE_ID=i-test MODEL_REPO=example/models COMMIT_SHA=0123456789abcdef
+# These are fake action inputs. The measure path deliberately contains a quote
+# and command-substitution syntax to verify they are passed literally to PowerShell.
+export GITHUB_RUN_ID=123
+export GITHUB_RUN_ATTEMPT=2
+export MODEL_REPO="solaristechnical/DEER-Prototypes-EnergyPlus"
+export COMMIT_SHA=64daae4514c08c7d93da60561c0f6384a464c300
 export MEASURE_PATH="commercial measures/Bob's \$(printf unsafe)"
-export S3_BUCKET=test-bucket WORKFLOW_PACKAGE_S3_KEY=githubactions/123/workflow.zip
-export GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
+export S3_BUCKET=test-bucket
+export WORKFLOW_PACKAGE_S3_KEY=githubactions/123/workflow.zip
+export SCENARIO_ID="SWHC030-03 Whole House Fan_SFm_1975"
+export INSTANCE_ID=i-test
 
+# Replace real delays and AWS calls in child Bash processes with test doubles.
 sleep() { :; }
 aws() {
   case "$1 $2" in
@@ -74,6 +87,7 @@ aws() {
 }
 export -f aws sleep
 
+# Read a named output from the current case's GitHub Actions output file.
 output() { sed -n "s/^$1=//p" "$GITHUB_OUTPUT"; }
 run_case() (
   local name="$1" expected="$2" result=success
@@ -85,6 +99,7 @@ run_case() (
   [[ "$MODE" != invalid-poll ]] || POLL_ATTEMPTS=0
   : > "$GITHUB_OUTPUT"
 
+  # Run each extracted step in order, preserving Actions outcomes and outputs.
   export SEND_COMMAND_OUTCOME=success
   bash -e -o pipefail "$test_dir/step-0.sh" > log 2>&1 || SEND_COMMAND_OUTCOME=failure
   export COMMAND_ID="$(output command_id)"
@@ -98,6 +113,7 @@ run_case() (
   export STEP_STATUS="$(output step_status)"
   bash -e -o pipefail "$test_dir/step-3.sh" >> log 2>&1 || result=failure
 
+  # Check the overall result and the specific contract exercised by this mode.
   if [[ "$result" != "$expected" ]]; then
     cat log
     echo "FAIL: $name (expected $expected, got $result)" >&2
@@ -114,6 +130,8 @@ run_case() (
       jq -e --arg step "-RequestedSteps '$DEER_STEP'" \
         '.commands[0] | contains($step)' parameters.json > /dev/null
       jq -e '.executionTimeout == ["14400"]' parameters.json > /dev/null
+      jq -e --arg scenario "-ScenarioId '$SCENARIO_ID'" \
+        '.commands[0] | contains($scenario)' parameters.json > /dev/null
       ;;
     Failed|Cancelled|TimedOut)
       [[ "$SSM_STATUS" == "$MODE" && "$(cat poll-count)" == 1 ]]
@@ -140,7 +158,7 @@ run_case() (
   echo "PASS: $name"
 )
 
-for step in package-qc compose compose-qc simulate; do
+for step in package-qc compose compose-qc simulate-1 simulate-2; do
   run_case "$step-success" success success "$step"
 done
 run_case invocation-eventual-consistency success delayed
@@ -148,3 +166,43 @@ run_case invalid-status-retry success retry-status
 for mode in Failed Cancelled TimedOut Pending unavailable send-error no-command missing malformed invalid-status deer-failure invalid-poll; do
   run_case "$mode" failure "$mode"
 done
+
+workflow_file="${WORKFLOW_FILE:-$action_dir/../../workflows/deer_simulations.yml}"
+yq -r '.jobs.package-qc.steps[] | select(.id == "simulationMatrix") | .run' "$workflow_file" > "$test_dir/matrix.sh"
+bash -n "$test_dir/matrix.sh"
+[[ "$(yq '.jobs.simulate.strategy.fail-fast' "$workflow_file")" == false ]]
+
+run_matrix_case() (
+  local name="$1" expected="$2" result=success
+  mkdir -p "$test_dir/$name/outputs"
+  cd "$test_dir/$name"
+  printf '%s' "$3" > outputs/scenario-index.json
+  export GITHUB_OUTPUT="$PWD/matrix-output"
+  bash "$test_dir/matrix.sh" > log 2>&1 || result=failure
+  if [[ "$result" != "$expected" ]]; then
+    cat log
+    echo "FAIL: $name (expected $expected, got $result)" >&2
+    exit 1
+  fi
+  if [[ "$result" == success ]]; then
+    sed -n 's/^matrix=//p' "$GITHUB_OUTPUT" |
+      jq -e --slurpfile scenarios outputs/scenario-index.json '
+        .include as $entries |
+        ($entries | length) == ($scenarios[0] | length) and
+        all(range(0; $entries | length); . as $index |
+          $entries[$index].scenario_id == $scenarios[0][$index].scenarioId and
+          $entries[$index].step == ("simulate-" + (($index + 1) | tostring)))' > /dev/null
+  fi
+  echo "PASS: $name"
+)
+
+run_matrix_case matrix-two-scenarios success '[{"scenarioId":"SWWH011 Central Storage Water Heater_MFm_Ex"},{"scenarioId":"SWWH011 Central Storage Water Heater_MFm_New"}]'
+run_matrix_case matrix-single-scenario success '[{"scenarioId":"Scenario One with spaces"}]'
+run_matrix_case matrix-quoted-scenario success '[{"scenarioId":"Scenario with a \"quote\" and $(printf unsafe)"}]'
+run_matrix_case matrix-empty failure '[]'
+run_matrix_case matrix-duplicate failure '[{"scenarioId":"Same"},{"scenarioId":"Same"}]'
+run_matrix_case matrix-missing-id failure '[{}]'
+run_matrix_case matrix-path-traversal failure '[{"scenarioId":"../outside"}]'
+run_matrix_case matrix-backslash failure '[{"scenarioId":"folder\\child"}]'
+run_matrix_case matrix-newline failure '[{"scenarioId":"first\nsecond"}]'
+run_matrix_case matrix-limit failure "$(jq -nc '[range(0;257) | {scenarioId:tostring}]')"

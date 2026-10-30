@@ -156,6 +156,7 @@ jobs:
       s3bucket: s3://${{ vars.SIMULATION_BUCKET }}/githubactions/${{ github.run_id }}
       start_date: ${{ steps.gitinfo.outputs.start_date }}
       sha: ${{ steps.gitinfo.outputs.sha }}
+      simulation_matrix: ${{ steps.simulationMatrix.outputs.matrix }}
     steps:
       # Checkout the model repository at the specified ref (branch, tag, or SHA)
       - uses: actions/checkout@v7
@@ -238,6 +239,27 @@ jobs:
           download_optional "outputs/package-qc/measure-qc.md" "outputs/measure-qc.md" "measure_qc_md_available"
           download_optional "outputs/package-qc/scenario-index.json" "outputs/scenario-index.json" "scenario_index_available"
           download_optional "summary.md" "outputs/run-summary.md" "run_summary_available"
+
+      - name: Build simulation matrix
+        id: simulationMatrix
+        if: ${{ inputs.simulate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Require 1-256 scenarios to stay within GitHub's matrix job limit.
+          # IDs must be unique, nonempty folder names without path separators or newlines.
+          jq -e 'type == "array" and length > 0 and length <= 256 and
+            all(.[]; .scenarioId | type == "string" and length > 0 and
+              . != "." and . != ".." and (test("[/\\\\\\r\\n]") | not)) and
+            ([.[].scenarioId] | length == (unique | length))' outputs/scenario-index.json > /dev/null
+          # Preserve exact folder names (including spaces) for scenario selection.
+          # Number steps in inventory order to give each job distinct status and artifact keys.
+          MATRIX=$(jq -c '{include: (to_entries | map({
+            scenario_id: .value.scenarioId,
+            step: ("simulate-" + ((.key + 1) | tostring))
+          }))}' outputs/scenario-index.json)
+          # Export compact, single-line JSON for the simulate job's fromJSON matrix expression.
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts bundle
         id: upload-artifacts
@@ -545,8 +567,12 @@ jobs:
           echo "- Included file: \`composeQc.json\`" >> "$GITHUB_STEP_SUMMARY"
 
   simulate:
+    name: ${{ matrix.step }} (${{ matrix.scenario_id }})
     needs: [start-cloud, package-qc, compose-qc]
     if: ${{ inputs.simulate == true }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.package-qc.outputs.simulation_matrix) }}
     # Note that a single-CPU runner is NOT compatible with this step due to a hard limit of 15 minutes per job.
     # See: https://docs.github.com/en/actions/reference/runners/github-hosted-runners#single-cpu-runners
     runs-on: ubuntu-latest
@@ -597,11 +623,13 @@ jobs:
           TAG_SPECIFICATIONS=$(jq -nc \
             --arg runId "${{ github.run_id }}" \
             --arg runAttempt "${{ github.run_attempt }}" \
+            --arg step "${{ matrix.step }}" \
             --arg modelRepo "$MODEL_REPO" \
             --arg branch "$MODEL_REF" \
             --arg measurePath "$MEASURE_PATH" \
             '[{ResourceType:"instance",Tags:[
-              {Key:"Name",Value:("deer_runner_" + $runId)},
+              {Key:"Name",Value:("deer_runner_" + $runId + "_" + $step)},
+              {Key:"SimulationStep",Value:$step},
               {Key:"Application",Value:"DEER simulations"},
               {Key:"GitHubRunId",Value:$runId},
               {Key:"GitHubRunAttempt",Value:$runAttempt},
@@ -614,7 +642,7 @@ jobs:
           INSTANCE_ID=$(aws ec2 run-instances \
             --launch-template "LaunchTemplateId=${{ vars.EC2_LAUNCH_TEMPLATE_ID }},Version=${{ vars.EC2_LAUNCH_TEMPLATE_VERSION }}" \
             --instance-type "${{ steps.instanceType.outputs.instance_type }}" \
-            --client-token "deer-${{ github.run_id }}-${{ github.run_attempt }}-simulate" \
+            --client-token "deer-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.step }}" \
             --tag-specifications "$TAG_SPECIFICATIONS" \
             --query 'Instances[0].InstanceId' --output text)
           test -n "$INSTANCE_ID" && test "$INSTANCE_ID" != None
@@ -648,14 +676,19 @@ jobs:
           commit-sha: ${{ needs.package-qc.outputs.sha }}
           measure-path: ${{ inputs.measure_path }}
           s3-bucket: ${{ vars.SIMULATION_BUCKET }}
-          requested-step: simulate
+          requested-step: ${{ matrix.step }}
+          scenario-id: ${{ matrix.scenario_id }}
           workflow-package-s3-key: ${{ needs.start-cloud.outputs.workflow_package_s3_key }}
           poll-attempts: '240'
           poll-interval-seconds: '60'
 
       - name: Download artifacts from S3
         id: download-artifacts
+        if: ${{ always() && steps.runDeer.outputs.command_id != '' }}
         shell: bash
+        env:
+          SCENARIO_ID: ${{ matrix.scenario_id }}
+          DEER_STEP: ${{ matrix.step }}
         run: |
           # Define a function to download required artifacts from S3 with retries
           download_required() {
@@ -675,39 +708,35 @@ jobs:
             echo "::error::Required artifact was not available: $source"
             return 1
           }
-          # Download scenario-index.json from the package-qc step outputs
-          download_required "outputs/package-qc/scenario-index.json" "scenario-index.json"
-
-          # Download transcript and simulate outputs for each scenario
-          download_required "attempt-${{ github.run_attempt }}/transcript_simulate.log" "transcript_simulate.log"
-
-          # Iterate over scenarios from scenario index
-          # Scenario index is just an unnamed list of dictionaries, each element representing a scenario with element scenarioId
-          # scenarioId is a folder name that may include spaces.
-          while IFS= read -r scenario; do
-            echo "Processing scenario: $scenario"
-            download_required "outputs/simulate/${scenario}/simulate.log" "outputs/simulate/${scenario}/simulate.log"
-          done < <(jq -r '.[].scenarioId' scenario-index.json)
+          download_required "attempt-${{ github.run_attempt }}/transcript_${DEER_STEP}.log" "transcript_${DEER_STEP}.log"
+          download_required "outputs/${DEER_STEP}/${SCENARIO_ID}/simulate.log" "outputs/${DEER_STEP}/${SCENARIO_ID}/simulate.log"
 
       - name: Upload artifacts
         id: upload-artifacts
+        if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
-          name: simulate-${{ github.run_id }}-${{github.run_attempt}}
+          name: ${{ matrix.step }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             step-status.json
-            transcript_simulate.log
-            outputs/simulate/*/simulate.log
+            transcript_${{ matrix.step }}.log
+            outputs/${{ matrix.step }}/*/simulate.log
           if-no-files-found: error
           retention-days: 30
 
       - name: Add summary
+        if: ${{ always() && hashFiles('step-status.json') != '' }}
         shell: bash
+        env:
+          SCENARIO_ID: ${{ matrix.scenario_id }}
+          DEER_STEP: ${{ matrix.step }}
         run: |
           STATUS=$(jq -r .Status step-status.json)
           echo "## Simulation task status" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Runtime (seconds): $(jq -r .RunTimeSeconds step-status.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- Step: $DEER_STEP" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Scenario: $SCENARIO_ID" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runtime (seconds): $(jq -r .DurationSeconds step-status.json)" >> $GITHUB_STEP_SUMMARY
           echo "- Status: $(jq -r .Status step-status.json)" >> $GITHUB_STEP_SUMMARY
           if [[ "$STATUS" != "Success" ]]; then
             echo "- Failure message: $(jq -r .FailureMessage step-status.json)" >> $GITHUB_STEP_SUMMARY
@@ -717,7 +746,7 @@ jobs:
           echo "### Downloads" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- [Simulation results](${{ steps.upload-artifacts.outputs.artifact-url }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Included file: \`transcript_simulate.log\` and \`outputs/simulate*.log\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Included files: \`transcript_${DEER_STEP}.log\` and scenario simulation log" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop ephemeral simulation instance
         if: ${{ always() && steps.launch.outputs.instance_id != '' && !inputs.keep_running }}

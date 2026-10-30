@@ -18,8 +18,11 @@ inputs:
     description: Simulation bucket name, without the s3 prefix.
     required: true
   requested-step:
-    description: DEER step to execute (package-qc, compose, compose-qc, or simulate).
+    description: DEER step to execute (package-qc, compose, compose-qc, or simulate-N).
     required: true
+  scenario-id:
+    description: Exact scenario folder name for a simulate-N step.
+    default: ''
   workflow-package-s3-key:
     description: S3 key of the frozen workflow package.
     required: true
@@ -66,6 +69,7 @@ runs:
         MEASURE_PATH: ${{ inputs.measure-path }}
         S3_BUCKET: ${{ inputs.s3-bucket }}
         DEER_STEP: ${{ inputs.requested-step }}
+        SCENARIO_ID: ${{ inputs.scenario-id }}
         WORKFLOW_PACKAGE_S3_KEY: ${{ inputs.workflow-package-s3-key }}
       run: |
         set -euo pipefail
@@ -88,6 +92,9 @@ runs:
         COMMAND+=" -S3Bucket $(ps_quote "$S3_BUCKET")"
         COMMAND+=" -RunAttempt $(ps_quote "$GITHUB_RUN_ATTEMPT")"
         COMMAND+=" -RequestedSteps $(ps_quote "$DEER_STEP")"
+        if [[ -n "$SCENARIO_ID" ]]; then
+          COMMAND+=" -ScenarioId $(ps_quote "$SCENARIO_ID")"
+        fi
         COMMAND+=" -WorkflowPackageS3Key $(ps_quote "$WORKFLOW_PACKAGE_S3_KEY")"
         echo "COMMAND=$COMMAND"
         PARAMS=$(jq -nc --arg command "$COMMAND" --arg executionTimeout "14400" \
