@@ -641,6 +641,7 @@ jobs:
       - name: Simulate models on EC2
         id: runDeer
         uses: ./workflow_repo/.github/actions/run-deer-ec2
+        timeout-minutes: 240
         with:
           instance-id: ${{ steps.launch.outputs.instance_id }}
           model-repo: ${{ inputs.model_repo }}

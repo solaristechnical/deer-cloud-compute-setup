@@ -89,7 +89,7 @@ runs:
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunPowerShellScript" \
           --parameters "$PARAMS" \
-          --timeout-seconds 3600 \
+          --timeout-seconds 14400 \
           --cloud-watch-output-config CloudWatchOutputEnabled=true,CloudWatchLogGroupName="/aws/ssm/githubactions" \
           --comment "DEER:$GITHUB_RUN_ID:$DEER_STEP" \
           --query 'Command.CommandId' \
