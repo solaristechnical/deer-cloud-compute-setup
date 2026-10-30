@@ -166,3 +166,43 @@ run_case invalid-status-retry success retry-status
 for mode in Failed Cancelled TimedOut Pending unavailable send-error no-command missing malformed invalid-status deer-failure invalid-poll; do
   run_case "$mode" failure "$mode"
 done
+
+workflow_file="${WORKFLOW_FILE:-$action_dir/../../workflows/deer_simulations.yml}"
+yq -r '.jobs.package-qc.steps[] | select(.id == "simulationMatrix") | .run' "$workflow_file" > "$test_dir/matrix.sh"
+bash -n "$test_dir/matrix.sh"
+[[ "$(yq '.jobs.simulate.strategy.fail-fast' "$workflow_file")" == false ]]
+
+run_matrix_case() (
+  local name="$1" expected="$2" result=success
+  mkdir -p "$test_dir/$name/outputs"
+  cd "$test_dir/$name"
+  printf '%s' "$3" > outputs/scenario-index.json
+  export GITHUB_OUTPUT="$PWD/matrix-output"
+  bash "$test_dir/matrix.sh" > log 2>&1 || result=failure
+  if [[ "$result" != "$expected" ]]; then
+    cat log
+    echo "FAIL: $name (expected $expected, got $result)" >&2
+    exit 1
+  fi
+  if [[ "$result" == success ]]; then
+    sed -n 's/^matrix=//p' "$GITHUB_OUTPUT" |
+      jq -e --slurpfile scenarios outputs/scenario-index.json '
+        .include as $entries |
+        ($entries | length) == ($scenarios[0] | length) and
+        all(range(0; $entries | length); . as $index |
+          $entries[$index].scenario_id == $scenarios[0][$index].scenarioId and
+          $entries[$index].step == ("simulate-" + (($index + 1) | tostring)))' > /dev/null
+  fi
+  echo "PASS: $name"
+)
+
+run_matrix_case matrix-two-scenarios success '[{"scenarioId":"SWWH011 Central Storage Water Heater_MFm_Ex"},{"scenarioId":"SWWH011 Central Storage Water Heater_MFm_New"}]'
+run_matrix_case matrix-single-scenario success '[{"scenarioId":"Scenario One with spaces"}]'
+run_matrix_case matrix-quoted-scenario success '[{"scenarioId":"Scenario with a \"quote\" and $(printf unsafe)"}]'
+run_matrix_case matrix-empty failure '[]'
+run_matrix_case matrix-duplicate failure '[{"scenarioId":"Same"},{"scenarioId":"Same"}]'
+run_matrix_case matrix-missing-id failure '[{}]'
+run_matrix_case matrix-path-traversal failure '[{"scenarioId":"../outside"}]'
+run_matrix_case matrix-backslash failure '[{"scenarioId":"folder\\child"}]'
+run_matrix_case matrix-newline failure '[{"scenarioId":"first\nsecond"}]'
+run_matrix_case matrix-limit failure "$(jq -nc '[range(0;257) | {scenarioId:tostring}]')"

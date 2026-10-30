@@ -10,6 +10,7 @@ param(
     [string]$MeasurePath,
     [string]$S3Bucket,
     [System.Object]$RequestedSteps,
+    [string]$ScenarioId,
     # S3 key (in $S3Bucket) of the deer-cloud-compute-setup ZIP archive frozen for this run.
     [string]$WorkflowPackageS3Key
 )
@@ -83,6 +84,7 @@ Invoke-DEERWorkflowController `
   -S3Bucket $S3Bucket `
   -RunAttempt $RunAttempt `
   -RequestedSteps $RequestedSteps `
+    -ScenarioId $ScenarioId `
   -WorkflowPackageS3Key $WorkflowPackageS3Key `
   -WorkflowCommitSha $WorkflowCommitSha
 

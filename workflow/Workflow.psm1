@@ -60,7 +60,8 @@ Invoke-PackageQc
 +-- measure-qc.md
 \-- scenario-index.json
 
-The compose and simulate steps iterate over the scenario inventory discovered at the package-qc step.
+The compose step iterates over the scenario inventory discovered at the package-qc step.
+Each simulate-N matrix job runs one scenario on its own instance.
 
 Invoke-Compose
 |
@@ -472,12 +473,23 @@ function Invoke-DEERWorkflowController {
     [string]$S3Bucket,
     [System.Object]$RequestedSteps,
     [string]$WorkflowPackageS3Key,
-    [string]$WorkflowCommitSha
+    [string]$WorkflowCommitSha,
+    [string]$ScenarioId
     )
     
-    $WorkingDirectory = "C:\githubactions\$RunId"
+    if ([string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+        $WorkingDirectory = "C:\githubactions\$RunId"
+    }
     $manifestPath = "$WorkingDirectory\run-manifest.json"
     $S3RunPath = "s3://$S3Bucket/githubactions/$RunId"
+    $S3SummaryPath = $S3RunPath
+    $simulationSteps = @($RequestedSteps | Where-Object { $_ -match '^simulate-[1-9][0-9]*$' })
+    if ($simulationSteps.Count -gt 0) {
+        if (@($RequestedSteps).Count -ne 1 -or [string]::IsNullOrWhiteSpace($ScenarioId)) {
+            throw 'A simulate-N request must specify exactly one step and a ScenarioId.'
+        }
+        $S3SummaryPath = "$S3RunPath/steps/$($simulationSteps[0])"
+    }
     
     Write-Host "Preparing to clone prototypes repository ..."
     
@@ -495,6 +507,7 @@ function Invoke-DEERWorkflowController {
     'collect',
     'calculate'
     )
+    $WorkflowSteps += $simulationSteps
     
     $StepHandlers = @{
         "package-qc" = {
@@ -523,8 +536,10 @@ function Invoke-DEERWorkflowController {
             Invoke-DEERSimulate -ManifestPath $manifestPath -RepoDir $RepoDir `
             -MeasurePath $MeasurePath `
             -WorkingDirectory $WorkingDirectory `
-            -OutputDirectory "$WorkingDirectory\outputs\simulate" `
-            -S3RunPath $S3RunPath
+            -OutputDirectory $OutputDirectory `
+            -S3RunPath $S3RunPath `
+            -ScenarioId $ScenarioId `
+            -StepName $step
         }
         
         "simulate-qc" = {
@@ -565,6 +580,11 @@ function Invoke-DEERWorkflowController {
     # Update requested steps in the manifest to match the current request
     $manifestObj = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
     $manifestObj.workflow.plannedSteps = @($WorkflowSteps)
+    foreach ($simulationStep in $simulationSteps) {
+        if ($simulationStep -notin $manifestObj.steps.PSObject.Properties.Name) {
+            $manifestObj.steps | Add-Member -NotePropertyName $simulationStep -NotePropertyValue $null
+        }
+    }
     
     # The workflow package is frozen when the run starts; re-run attempts must use the same package.
     $frozenPackage = $manifestObj.workflow.PSObject.Properties['package']
@@ -589,9 +609,10 @@ function Invoke-DEERWorkflowController {
 "@
     
     foreach ($step in $RequestedSteps) {
+        $handlerName = if ($step -match '^simulate-[1-9][0-9]*$') { 'simulate' } else { $step }
         # Validate StepName is a valid workflow step
         $validSteps = $StepHandlers.Keys
-        if ($step -notin $validSteps) {
+        if ($handlerName -notin $validSteps) {
             throw "Invalid step name: $step"
         }
         $OutputDirectory = "$WorkingDirectory\outputs\$step"
@@ -604,7 +625,7 @@ function Invoke-DEERWorkflowController {
         -WorkingDirectory $WorkingDirectory `
         -OutputDirectory $OutputDirectory `
         -ManifestPath $manifestPath `
-        -Command $StepHandlers[$step]
+        -Command $StepHandlers[$handlerName]
         
         Update-Manifest -WorkingDirectory $WorkingDirectory
         
@@ -625,12 +646,12 @@ function Invoke-DEERWorkflowController {
     # Sync summary.md to S3
     aws s3 cp `
     "$summaryPath" `
-    "s3://$S3Bucket/githubactions/$RunId/summary.md"
+    "$S3SummaryPath/summary.md"
     
     # Sync run-manifest.json to S3
     aws s3 cp `
     "$manifestPath" `
-    "s3://$S3Bucket/githubactions/$RunId/run-manifest.json"
+    "$S3SummaryPath/run-manifest.json"
 }
 
 function Invoke-GenerateManifest {
@@ -937,25 +958,34 @@ function Invoke-ComposeQc {
 
 function Invoke-DEERSimulate {
     param(
-    [string]$RepoDir,
-    [string]$MeasurePath,
-    [string]$WorkingDirectory,
-    [string]$OutputDirectory,
-    [string]$ManifestPath,
-    [string]$S3RunPath
+        [string]$RepoDir,
+        [string]$MeasurePath,
+        [string]$WorkingDirectory,
+        [string]$OutputDirectory,
+        [string]$ManifestPath,
+        [string]$S3RunPath,
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ScenarioId,
+        [string]$StepName = 'simulate'
     )
     
     # Prepare to read the scenario index
     $scenarioIndexPath =
     "$WorkingDirectory\outputs\package-qc\scenario-index.json"
     
+    New-Item -ItemType Directory -Force -Path (Split-Path $scenarioIndexPath -Parent) | Out-Null
     & aws s3 cp "$S3RunPath/outputs/package-qc/scenario-index.json" "$scenarioIndexPath"
     
     if (-not (Test-Path $scenarioIndexPath)) {
         throw "Scenario index not found: $scenarioIndexPath"
     }
     
-    $scenarios = Get-Content $scenarioIndexPath -Raw | ConvertFrom-Json
+    $scenarios = @(Get-Content $scenarioIndexPath -Raw | ConvertFrom-Json)
+    $selectedScenarios = @($scenarios | Where-Object { $_.scenarioId -ceq $ScenarioId })
+    if ($selectedScenarios.Count -ne 1 -or $ScenarioId -in @('.', '..') -or $ScenarioId -match '[/\\\r\n]') {
+        throw "ScenarioId must identify exactly one scenario subfolder in the scenario index: $ScenarioId"
+    }
     
     # Prepare to read and write the .modelkit-config file
     $configFile = Join-Path (Join-Path $RepoDir $MeasurePath) ".modelkit-config"
@@ -966,239 +996,235 @@ function Invoke-DEERSimulate {
     $simulateFailures = 0
     $simulateOutputBytes = 0
     
-    foreach ($scenario in $scenarios) {
+    $scenarioOutputDir = Join-Path $OutputDirectory $scenarioId
+    New-Item -ItemType Directory -Force -Path $scenarioOutputDir | Out-Null
         
-        $scenarioId = $scenario.scenarioId
-        $scenarioOutputDir = Join-Path $OutputDirectory $scenarioId
-        New-Item -ItemType Directory -Force -Path $scenarioOutputDir | Out-Null
+    $stepStatusPath = Join-Path $scenarioOutputDir "step-status.json"
         
-        $stepStatusPath = Join-Path $scenarioOutputDir "step-status.json"
+    $simulateLog = Join-Path $scenarioOutputDir "simulate.log"
+    # Create simulation log if it does not exist
+    if (-not (Test-Path $simulateLog)) {
+        New-Item -ItemType File -Force -Path $simulateLog | Out-Null
+    }
         
-        $simulateLog = Join-Path $scenarioOutputDir "simulate.log"
-        # Create simulation log if it does not exist
-        if (-not (Test-Path $simulateLog)) {
-            New-Item -ItemType File -Force -Path $simulateLog | Out-Null
-        }
+    $scenarioRoot = Join-Path (Join-Path $RepoDir $MeasurePath) $scenarioId
         
-        $scenarioRoot = Join-Path (Join-Path $RepoDir $MeasurePath) $scenarioId
+    $MeasureRunsDir = Join-Path $scenarioRoot "runs"
         
-        $MeasureRunsDir = Join-Path $scenarioRoot "runs"
+    $startTime = Get-Date
+    $scenarioStatus = @{
+        Step = $StepName
+        ScenarioId = $scenarioId
+        Status = "Running"
+        StartTime = $startTime
+    }
         
-        $startTime = Get-Date
-        $scenarioStatus = @{
-            Step = "simulate"
-            ScenarioId = $scenarioId
-            Status = "Running"
-            StartTime = $startTime
-        }
-        
+    try {
+            
+        # TODO: the oustide workflow layer should determine appropriate max-workers and launch a virtual machine with matching vCPUs.
+        # Then, this workflow step should be called with maxWorkersOverride as an argument.
+        # TODO: if an override is specified, here we adjust max-workers setting in .modelkit-config
+            
+        # Temporary solution: use the numCpus - 1 as the max-workers setting in .modelkit-config
+        # Caution: this cannot work in parallel on the same machine if the controller tries to run multiple scenarios simultaneously.
+        $numProcessors = [Environment]::ProcessorCount
+        $maxWorkers = [Math]::Max(1, $numProcessors - 1)
+            
+        (Get-Content $configFile -Raw) -replace 'max-workers = \d+', "max-workers = $maxWorkers" | Set-Content $configFile
+            
+        # Fetch the existing simulation output from S3 before running the simulation to ensure we have the latest state.
+        # If the S3 folder does not exist, continue without error.
+        Write-Host "Dry run for syncing simulation output from S3 simulate $scenarioId..."
+        & aws s3 sync "$S3RunPath/simulate/$scenarioId/runs" "$MeasureRunsDir" --dryrun --only-show-errors
         try {
-            
-            # TODO: the oustide workflow layer should determine appropriate max-workers and launch a virtual machine with matching vCPUs.
-            # Then, this workflow step should be called with maxWorkersOverride as an argument.
-            # TODO: if an override is specified, here we adjust max-workers setting in .modelkit-config
-            
-            # Temporary solution: use the numCpus - 1 as the max-workers setting in .modelkit-config
-            # Caution: this cannot work in parallel on the same machine if the controller tries to run multiple scenarios simultaneously.
-            $numProcessors = [Environment]::ProcessorCount
-            $maxWorkers = [Math]::Max(1, $numProcessors - 1)
-            
-            (Get-Content $configFile -Raw) -replace 'max-workers = \d+', "max-workers = $maxWorkers" | Set-Content $configFile
-            
-            # Fetch the existing simulation output from S3 before running the simulation to ensure we have the latest state.
-            # If the S3 folder does not exist, continue without error.
-            Write-Host "Dry run for syncing simulation output from S3 simulate $scenarioId..."
-            & aws s3 sync "$S3RunPath/simulate/$scenarioId/runs" "$MeasureRunsDir" --dryrun --only-show-errors
+            Write-Host "Attempting to sync from S3 simulate folder..."
+            & aws s3 sync "$S3RunPath/simulate/$scenarioId/runs" "$MeasureRunsDir" --exact-timestamps
+        } catch {
+            Write-Host "Warning: Failed to sync simulation output from S3 simulate $scenarioId. Trying compose folder ..."
             try {
-                Write-Host "Attempting to sync from S3 simulate folder..."
-                & aws s3 sync "$S3RunPath/simulate/$scenarioId/runs" "$MeasureRunsDir" --exact-timestamps
+                & aws s3 sync "$S3RunPath/compose/$scenarioId/runs" "$MeasureRunsDir" --exact-timestamps
             } catch {
-                Write-Host "Warning: Failed to sync simulation output from S3 simulate $scenarioId. Trying compose folder ..."
-                try {
-                    & aws s3 sync "$S3RunPath/compose/$scenarioId/runs" "$MeasureRunsDir" --exact-timestamps
-                } catch {
-                    Write-Host "Warning: Failed to sync simulation output from S3 compose $scenarioId."
-                    Write-Host "Modelkit will compose models from scratch."
-                }
+                Write-Host "Warning: Failed to sync simulation output from S3 compose $scenarioId."
+                Write-Host "Modelkit will compose models from scratch."
             }
+        }
             
-            # Log the simulation environment details before starting the simulation.
-            Write-Host "SIMULATE_MARKER: before modelkit"
-            Write-Host "Scenario root: $scenarioRoot"
-            Write-Host "Runs directory: $MeasureRunsDir"
-            Write-Host "Processor count: $numProcessors"
-            Write-Host "Max workers: $maxWorkers"
-            Write-Host "Modelkit path: $((Get-Command modelkit -ErrorAction Stop).Source)"
-            Write-Host "Free disk GB: $([math]::Round((Get-PSDrive C).Free / 1GB, 2))"
+        # Log the simulation environment details before starting the simulation.
+        Write-Host "SIMULATE_MARKER: before modelkit"
+        Write-Host "Scenario root: $scenarioRoot"
+        Write-Host "Runs directory: $MeasureRunsDir"
+        Write-Host "Processor count: $numProcessors"
+        Write-Host "Max workers: $maxWorkers"
+        Write-Host "Modelkit path: $((Get-Command modelkit -ErrorAction Stop).Source)"
+        Write-Host "Free disk GB: $([math]::Round((Get-PSDrive C).Free / 1GB, 2))"
             
-            # Run modelkit in the background while this process monitors simulation progress.
-            Write-Host "Starting simulation background job..."
-            $jobRun = Start-Job `
+        # Run modelkit in the background while this process monitors simulation progress.
+        Write-Host "Starting simulation background job..."
+        $jobRun = Start-Job `
             -ArgumentList $scenarioRoot, $simulateLog `
             -ScriptBlock {
-                param($scenarioRoot, $simulateLog)
-                # Run the simulation and append output to the log.
-                # This ensures that if the simulation is restarted, previous logs are preserved.
-                Set-Location $scenarioRoot
+            param($scenarioRoot, $simulateLog)
+            # Run the simulation and append output to the log.
+            # This ensures that if the simulation is restarted, previous logs are preserved.
+            Set-Location $scenarioRoot
                 
-                "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Simulation child job started ..." |
+            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Simulation child job started ..." |
                 Add-Content -Path $simulateLog -Append
                 
-                $modelkitCommand = (Get-Command modelkit -ErrorAction Stop).Source
-                "Modelkit command: $modelkitCommand" |
+            $modelkitCommand = (Get-Command modelkit -ErrorAction Stop).Source
+            "Modelkit command: $modelkitCommand" |
                 Add-Content -Path $simulateLog -Append
                 
-                & modelkit rake run *>&1 |
+            & modelkit rake run *>&1 |
                 Tee-Object -FilePath $simulateLog -Append |
                 Out-Host
                 
-                $modelkitExitCode = $LASTEXITCODE
-                Write-Host "SIMULATE_MARKER: modelkit exited with $modelkitExitCode"
-                "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Modelkit exit code: $modelkitExitCode" |
+            $modelkitExitCode = $LASTEXITCODE
+            Write-Host "SIMULATE_MARKER: modelkit exited with $modelkitExitCode"
+            "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Modelkit exit code: $modelkitExitCode" |
                 Add-Content -Path $simulateLog -Append
                 
-                if ($modelkitExitCode -ne 0) {
-                    throw "modelkit rake run failed with exit code $modelkitExitCode"
-                }
+            if ($modelkitExitCode -ne 0) {
+                throw "modelkit rake run failed with exit code $modelkitExitCode"
             }
+        }
             
-            $jobStoppedAfterCompletion = $false
-            $completionDelaySeconds = 30
-            while ($jobRun.State -notin @("Completed", "Failed", "Stopped")) {
-                # Count composed models and completed simulations.
-                $modelFiles = @(Get-ChildItem $MeasureRunsDir -Recurse -File -Filter "instance.idf")
-                $completedFiles = @(Get-ChildItem $MeasureRunsDir -Recurse -File -Filter "instance-out.sql")
-                $totalModels = $modelFiles.Count
-                $completedSimulations = $completedFiles.Count
-                $percentComplete = if ($totalModels -gt 0) { ($completedSimulations / $totalModels) * 100 } else { 0 }
+        $jobStoppedAfterCompletion = $false
+        $completionDelaySeconds = 30
+        while ($jobRun.State -notin @("Completed", "Failed", "Stopped")) {
+            # Count composed models and completed simulations.
+            $modelFiles = @(Get-ChildItem $MeasureRunsDir -Recurse -File -Filter "instance.idf")
+            $completedFiles = @(Get-ChildItem $MeasureRunsDir -Recurse -File -Filter "instance-out.sql")
+            $totalModels = $modelFiles.Count
+            $completedSimulations = $completedFiles.Count
+            $percentComplete = if ($totalModels -gt 0) { ($completedSimulations / $totalModels) * 100 } else { 0 }
                 
-                # Find the timestamp of the last completed simulation.
-                $lastUpdatedUtc = $completedFiles |
+            # Find the timestamp of the last completed simulation.
+            $lastUpdatedUtc = $completedFiles |
                 Sort-Object LastWriteTime -Descending |
                 Select-Object -First 1 |
                 ForEach-Object { $_.LastWriteTimeUtc }
                 
-                # Estimate remaining time from the average time per completed simulation.
-                # If no simulations have been completed yet, assume the average time per simulation is 10 minutes.
-                $averageMinutesPerSimulation = if ($completedSimulations -gt 0) { ((Get-Date) - $startTime).TotalMinutes / $completedSimulations } else { 10 }
-                $remainingSimulations = $totalModels - $completedSimulations
-                $estimatedRemainingMinutes = $remainingSimulations * $averageMinutesPerSimulation
+            # Estimate remaining time from the average time per completed simulation.
+            # If no simulations have been completed yet, assume the average time per simulation is 10 minutes.
+            $averageMinutesPerSimulation = if ($completedSimulations -gt 0) { ((Get-Date) - $startTime).TotalMinutes / $completedSimulations } else { 10 }
+            $remainingSimulations = $totalModels - $completedSimulations
+            $estimatedRemainingMinutes = $remainingSimulations * $averageMinutesPerSimulation
                 
-                $progress = @{
-                    Status = "running"
-                    CompletedSimulations = $completedSimulations
-                    TotalModels = $totalModels
-                    PercentComplete = $percentComplete
-                    LastUpdatedUtc = $lastUpdatedUtc
-                    EstimatedRemainingMinutes = $estimatedRemainingMinutes
-                }
-                $progress | ConvertTo-Json | Set-Content (Join-Path $scenarioOutputDir "progress.json")
+            $progress = @{
+                Status = "running"
+                CompletedSimulations = $completedSimulations
+                TotalModels = $totalModels
+                PercentComplete = $percentComplete
+                LastUpdatedUtc = $lastUpdatedUtc
+                EstimatedRemainingMinutes = $estimatedRemainingMinutes
+            }
+            $progress | ConvertTo-Json | Set-Content (Join-Path $scenarioOutputDir "progress.json")
                 
-                # Generate progress.md for web updates
-                # Use a here-string to generate the Markdown content for the progress report.
-                $progressMarkdown = @"
+            # Generate progress.md for web updates
+            # Use a here-string to generate the Markdown content for the progress report.
+            $progressMarkdown = @"
 # Simulation Progress
-                
+
 - Completed: $completedSimulations / $totalModels
 - Percent Complete: $percentComplete%
 - Estimated Remaining Minutes: $estimatedRemainingMinutes
 - Last Updated: $lastUpdatedUtc
 "@
-                $progressMarkdown | Set-Content (Join-Path $scenarioOutputDir "progress.md")
+            $progressMarkdown | Set-Content (Join-Path $scenarioOutputDir "progress.md")
                 
-                # Copy the progress files to the S3 output location
-                & aws s3 cp (Join-Path $scenarioOutputDir "progress.json") "$S3RunPath/simulate/$scenarioId/progress.json" --acl bucket-owner-full-control
-                & aws s3 cp (Join-Path $scenarioOutputDir "progress.md") "$S3RunPath/simulate/$scenarioId/progress.md" --acl bucket-owner-full-control
+            # Copy the progress files to the S3 output location
+            & aws s3 cp (Join-Path $scenarioOutputDir "progress.json") "$S3RunPath/simulate/$scenarioId/progress.json" --acl bucket-owner-full-control
+            & aws s3 cp (Join-Path $scenarioOutputDir "progress.md") "$S3RunPath/simulate/$scenarioId/progress.md" --acl bucket-owner-full-control
                 
-                if ($totalModels -gt 0 -and $completedSimulations -ge $totalModels) {
-                    Write-Host "All $totalModels simulations are complete. Waiting $completionDelaySeconds seconds before stopping modelkit."
-                    Start-Sleep -Seconds $completionDelaySeconds
+            if ($totalModels -gt 0 -and $completedSimulations -ge $totalModels) {
+                Write-Host "All $totalModels simulations are complete. Waiting $completionDelaySeconds seconds before stopping modelkit."
+                Start-Sleep -Seconds $completionDelaySeconds
                     
-                    if ($jobRun.State -notin @("Completed", "Failed", "Stopped")) {
-                        Stop-Job $jobRun -ErrorAction SilentlyContinue
-                        $jobStoppedAfterCompletion = $true
-                    }
-                    break
+                if ($jobRun.State -notin @("Completed", "Failed", "Stopped")) {
+                    Stop-Job $jobRun -ErrorAction SilentlyContinue
+                    $jobStoppedAfterCompletion = $true
                 }
-                
-                Start-Sleep -Seconds 30
+                break
             }
-            
-            # Collect modelkit output and preserve natural job failures.
-            if ($jobRun.State -eq "Running") {
-                Wait-Job $jobRun -ErrorAction SilentlyContinue
-            }
-            $jobOutput = Receive-Job $jobRun -Keep -ErrorAction SilentlyContinue
-            $jobOutput | forEach-Object { Write-Host "[simulate child] $_" }
-            $jobExitCode = $jobRun.ChildJobs[0].ExitCode
-            Write-Host "[simulate child] Exit code: $jobExitCode"
-            Write-Host "[simulate child] Job run state: $($jobRun.State)"
-            if ($jobRun.State -ne "Completed" -and -not ($jobStoppedAfterCompletion -and $jobRun.State -eq "Stopped")) {
-                Write-Host "[simulate child] Job did not complete successfully for scenario $scenarioId"
-                $reasons = $jobRun.ChildJobs[0].JobStateInfo | ForEach-Object { $_.Reason }
-                $jobRun.ChildJobs[0].JobStateInfo | ForEach-Object {
-                    Write-Host "[simulate child] Job state reason: $($_.Reason)"
-                }
-                throw "Simulation job ended in state $($jobRun.State): $($reasons -join "; ")"
-            }
-            stop-job $jobRun -ErrorAction SilentlyContinue
-            remove-job $jobRun -ErrorAction SilentlyContinue
-            
-            Pop-Location
-            
-            $scenarioStatus.Status = "Succeeded"
-            
-            $simulateSuccesses++
-            
+
+            Start-Sleep -Seconds 30
         }
-        catch {
             
-            Pop-Location -ErrorAction SilentlyContinue
-            
-            $scenarioStatus.Status = "Failed"
-            $scenarioStatus.FailureMessage = $_.Exception.Message
-            
-            $simulateFailures++
-            
-            # Sprint 1 default behavior:
-            # stop on first failure
-            
-            $scenarioStatus | ConvertTo-Json | Set-Content $stepStatusPath
-            
-            throw
-            
+        # Collect modelkit output and preserve natural job failures.
+        if ($jobRun.State -eq "Running") {
+            Wait-Job $jobRun -ErrorAction SilentlyContinue
         }
-        finally {
+        $jobOutput = Receive-Job $jobRun -Keep -ErrorAction SilentlyContinue
+        $jobOutput | forEach-Object { Write-Host "[simulate child] $_" }
+        $jobExitCode = $jobRun.ChildJobs[0].ExitCode
+        Write-Host "[simulate child] Exit code: $jobExitCode"
+        Write-Host "[simulate child] Job run state: $($jobRun.State)"
+        if ($jobRun.State -ne "Completed" -and -not ($jobStoppedAfterCompletion -and $jobRun.State -eq "Stopped")) {
+            Write-Host "[simulate child] Job did not complete successfully for scenario $scenarioId"
+            $reasons = $jobRun.ChildJobs[0].JobStateInfo | ForEach-Object { $_.Reason }
+            $jobRun.ChildJobs[0].JobStateInfo | ForEach-Object {
+                Write-Host "[simulate child] Job state reason: $($_.Reason)"
+            }
+            throw "Simulation job ended in state $($jobRun.State): $($reasons -join "; ")"
+        }
+        stop-job $jobRun -ErrorAction SilentlyContinue
+        remove-job $jobRun -ErrorAction SilentlyContinue
             
-            $scenarioStatus.EndTime = Get-Date
+        Pop-Location
             
-            $scenarioStatus.DurationSeconds =
-            ($scenarioStatus.EndTime - $scenarioStatus.StartTime).TotalSeconds
+        $scenarioStatus.Status = "Succeeded"
             
-            $scenarioStatus | ConvertTo-Json -Depth 20 |
+        $simulateSuccesses++
+            
+    }
+    catch {
+            
+        Pop-Location -ErrorAction SilentlyContinue
+            
+        $scenarioStatus.Status = "Failed"
+        $scenarioStatus.FailureMessage = $_.Exception.Message
+            
+        $simulateFailures++
+            
+        # Sprint 1 default behavior:
+        # stop on first failure
+            
+        $scenarioStatus | ConvertTo-Json | Set-Content $stepStatusPath
+            
+        throw
+            
+    }
+    finally {
+            
+        $scenarioStatus.EndTime = Get-Date
+            
+        $scenarioStatus.DurationSeconds =
+        ($scenarioStatus.EndTime - $scenarioStatus.StartTime).TotalSeconds
+            
+        $scenarioStatus | ConvertTo-Json -Depth 20 |
             Set-Content $stepStatusPath
-        }
+    }
         
-        $simulateOutputBytes += (Get-ChildItem $MeasureRunsDir -Recurse -File | Measure-Object Length -Sum).Sum
-        $logBytes = (Get-Item $simulateLog).Length
-        $simulateOutputBytes += $logBytes
-        # TODO: archive runs folder to S3
+    $simulateOutputBytes += (Get-ChildItem $MeasureRunsDir -Recurse -File | Measure-Object Length -Sum).Sum
+    $logBytes = (Get-Item $simulateLog).Length
+    $simulateOutputBytes += $logBytes
+    # TODO: archive runs folder to S3
         
-        $outputFiles += @(
+    $outputFiles += @(
         [PSCustomObject]@{
             Path = "$scenarioId\simulate.log"
             Bytes = $logBytes
         }
-        )
+    )
         
-        # Archive the measure file to S3, removing any files that no longer exist locally
-        Write-Host "Syncing measure files to S3 (dry run to test permissions)..."
-        & aws s3 sync "$MeasureRunsDir" "$S3RunPath/simulate/$scenarioId/runs" --acl bucket-owner-full-control --delete --dryrun --only-show-errors
-        Write-Host "Dry run complete."
-        Write-Host "Syncing for real..."
-        & aws s3 sync "$MeasureRunsDir" "$S3RunPath/simulate/$scenarioId/runs" --acl bucket-owner-full-control --delete
-        Write-Host "Sync complete."
-    }
+    # Archive the measure file to S3, removing any files that no longer exist locally
+    Write-Host "Syncing measure files to S3 (dry run to test permissions)..."
+    & aws s3 sync "$MeasureRunsDir" "$S3RunPath/simulate/$scenarioId/runs" --acl bucket-owner-full-control --delete --dryrun --only-show-errors
+    Write-Host "Dry run complete."
+    Write-Host "Syncing for real..."
+    & aws s3 sync "$MeasureRunsDir" "$S3RunPath/simulate/$scenarioId/runs" --acl bucket-owner-full-control --delete
+    Write-Host "Sync complete."
     
     return [PSCustomObject]@{
         
@@ -1207,7 +1233,8 @@ function Invoke-DEERSimulate {
         OutputFiles = $outputFiles
         
         Metrics = @{
-            ScenarioCount      = $scenarios.Count
+            ScenarioId         = $ScenarioId
+            ScenarioCount      = 1
             SimulateSuccesses   = $simulateSuccesses
             SimulateFailures    = $simulateFailures
             SimulateOutputBytes = $simulateOutputBytes
