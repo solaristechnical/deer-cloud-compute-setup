@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Windows Server 2022 CodeBuild publisher for the DEER container
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Description: GitHub owner/repository allowed to publish from main
+    AllowedPattern: '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+  GitHubOidcProviderArn:
+    Type: String
+    Description: Existing IAM OIDC provider for https://token.actions.githubusercontent.com
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:oidc-provider/token.actions.githubusercontent.com'
+  ProjectName:
+    Type: String
+    Default: deer-windows-build
+    AllowedPattern: '[A-Za-z][A-Za-z0-9-]{1,99}'
+  RepositoryName:
+    Type: String
+    Default: deer-windows
+    AllowedPattern: '[a-z][a-z0-9-]{1,99}'
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireBuildSources
+            Status: Enabled
+            Prefix: sources/
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub '${SourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageTagMutability: IMMUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      EmptyOnDelete: false
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}'
+      RetentionInDays: 30
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${ProjectName}'
+      Policies:
+        - PolicyName: BuildAndPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${SourceBucket.Arn}/sources/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetBucketAcl
+                Resource: !GetAtt SourceBucket.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${BuildLogGroup}:log-stream:*'
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                Resource: !GetAtt ImageRepository.Arn
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      ServiceRole: !GetAtt BuildRole.Arn
+      ConcurrentBuildLimit: 1
+      TimeoutInMinutes: 180
+      QueuedTimeoutInMinutes: 30
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: S3
+        Location: !Sub '${SourceBucket}/sources/bootstrap.zip'
+        BuildSpec: docker/windows/aws/buildspec.yml
+      Environment:
+        Type: WINDOWS_SERVER_2022_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/windows-base:2022-1.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: ECR_REPOSITORY_URI
+            Value: !GetAtt ImageRepository.RepositoryUri
+          - Name: ECR_REPOSITORY_NAME
+            Value: !Ref RepositoryName
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+          StreamName: build
+
+  GitHubBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 14400
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubRepository}:ref:refs/heads/main'
+      Policies:
+        - PolicyName: SubmitWindowsBuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${SourceBucket.Arn}/sources/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StopBuild
+                Resource: !GetAtt BuildProject.Arn
+
+Outputs:
+  AWSRegion:
+    Value: !Ref AWS::Region
+  GitHubBuildRoleArn:
+    Value: !GetAtt GitHubBuildRole.Arn
+  CodeBuildProjectName:
+    Value: !Ref BuildProject
+  SourceBucketName:
+    Value: !Ref SourceBucket
+  EcrRepositoryUri:
+    Value: !GetAtt ImageRepository.RepositoryUri
+  BuildLogGroupName:
+    Value: !Ref BuildLogGroup
