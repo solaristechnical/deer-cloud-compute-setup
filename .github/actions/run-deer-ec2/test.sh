@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Requires bash, jq, and mikefarah/yq v4. No AWS credentials or network access are used.
+# Requires Bash, jq, and mikefarah/yq v4. The AWS CLI is mocked; no credentials or network access are used.
+# Keep this file LF-terminated; Windows core.autocrlf=true can make Bash reject it in WSL or Docker.
 action_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 test_dir="$(mktemp -d)"
 trap 'rm -rf "$test_dir"' EXIT
+# Extract each action's inline script so the harness tests the real step bodies.
+# Assumption to verify if action.yml changes: the four run blocks remain steps 0-3.
 for index in 0 1 2 3; do
   yq -r ".runs.steps[$index].run" "$action_dir/action.yml" > "$test_dir/step-$index.sh"
   bash -n "$test_dir/step-$index.sh"
 done
 
+# These are fake action inputs. The measure path deliberately contains a quote
+# and command-substitution syntax to verify they are passed literally to PowerShell.
 export GITHUB_RUN_ID=123
 export GITHUB_RUN_ATTEMPT=2
 export MODEL_REPO="solaristechnical/DEER-Prototypes-EnergyPlus"
@@ -20,6 +25,7 @@ export WORKFLOW_PACKAGE_S3_KEY=githubactions/123/workflow.zip
 export SCENARIO_ID="SWHC030-03 Whole House Fan_SFm_1975"
 export INSTANCE_ID=i-test
 
+# Replace real delays and AWS calls in child Bash processes with test doubles.
 sleep() { :; }
 aws() {
   case "$1 $2" in
@@ -79,6 +85,7 @@ aws() {
 }
 export -f aws sleep
 
+# Read a named output from the current case's GitHub Actions output file.
 output() { sed -n "s/^$1=//p" "$GITHUB_OUTPUT"; }
 run_case() (
   local name="$1" expected="$2" result=success
@@ -90,6 +97,7 @@ run_case() (
   [[ "$MODE" != invalid-poll ]] || POLL_ATTEMPTS=0
   : > "$GITHUB_OUTPUT"
 
+  # Run each extracted step in order, preserving Actions outcomes and outputs.
   export SEND_COMMAND_OUTCOME=success
   bash -e -o pipefail "$test_dir/step-0.sh" > log 2>&1 || SEND_COMMAND_OUTCOME=failure
   export COMMAND_ID="$(output command_id)"
@@ -103,6 +111,7 @@ run_case() (
   export STEP_STATUS="$(output step_status)"
   bash -e -o pipefail "$test_dir/step-3.sh" >> log 2>&1 || result=failure
 
+  # Check the overall result and the specific contract exercised by this mode.
   if [[ "$result" != "$expected" ]]; then
     cat log
     echo "FAIL: $name (expected $expected, got $result)" >&2
@@ -119,7 +128,7 @@ run_case() (
       jq -e --arg step "-RequestedSteps '$DEER_STEP'" \
         '.commands[0] | contains($step)' parameters.json > /dev/null
       jq -e '.executionTimeout == ["14400"]' parameters.json > /dev/null
-      jq -e --arg scenario "-ScenarioId 'Scenario Bob''s \$(printf unsafe)'" \
+      jq -e --arg scenario "-ScenarioId '$SCENARIO_ID'" \
         '.commands[0] | contains($scenario)' parameters.json > /dev/null
       ;;
     Failed|Cancelled|TimedOut)
