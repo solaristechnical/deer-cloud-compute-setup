@@ -113,6 +113,7 @@ run_case() (
         '.commands[0] | contains($fragment)' parameters.json > /dev/null
       jq -e --arg step "-RequestedSteps '$DEER_STEP'" \
         '.commands[0] | contains($step)' parameters.json > /dev/null
+      jq -e '.executionTimeout == ["14400"]' parameters.json > /dev/null
       ;;
     Failed|Cancelled|TimedOut)
       [[ "$SSM_STATUS" == "$MODE" && "$(cat poll-count)" == 1 ]]

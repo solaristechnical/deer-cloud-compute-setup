@@ -74,6 +74,12 @@ runs:
           local value="${1//\'/\'\'}"
           printf "'%s'" "$value"
         }
+        # Note regarding ssm timeouts:
+        # Command line argument `--timeout-seconds` refers to delivery of the command.
+        # Default is 600s.
+        # Inside parameters, `executionTimeout` controls how long the SSM connection will
+        # report back status before reporting TimedOut (ExecutionTimedOut).
+        # Set executionTimeout to 14400s for the command.
         COMMAND="pwsh 'C:/DEER/deer-cloud-compute-setup/workflow/BootstrapSimulation.ps1'"
         COMMAND+=" -RunId $(ps_quote "$GITHUB_RUN_ID")"
         COMMAND+=" -Repository $(ps_quote "$MODEL_REPO")"
@@ -84,12 +90,13 @@ runs:
         COMMAND+=" -RequestedSteps $(ps_quote "$DEER_STEP")"
         COMMAND+=" -WorkflowPackageS3Key $(ps_quote "$WORKFLOW_PACKAGE_S3_KEY")"
         echo "COMMAND=$COMMAND"
-        PARAMS=$(jq -nc --arg command "$COMMAND" '{commands:[$command]}')
+        PARAMS=$(jq -nc --arg command "$COMMAND" --arg executionTimeout "14400" \
+          '{commands:[$command],executionTimeout:[$executionTimeout]}')
         COMMAND_ID=$(aws ssm send-command \
           --instance-ids "$INSTANCE_ID" \
           --document-name "AWS-RunPowerShellScript" \
           --parameters "$PARAMS" \
-          --timeout-seconds 14400 \
+          --timeout-seconds 600 \
           --cloud-watch-output-config CloudWatchOutputEnabled=true,CloudWatchLogGroupName="/aws/ssm/githubactions" \
           --comment "DEER:$GITHUB_RUN_ID:$DEER_STEP" \
           --query 'Command.CommandId' \
