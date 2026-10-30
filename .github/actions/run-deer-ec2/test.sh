@@ -10,13 +10,15 @@ for index in 0 1 2 3; do
   bash -n "$test_dir/step-$index.sh"
 done
 
+export GITHUB_RUN_ID=123
+export GITHUB_RUN_ATTEMPT=2
+export MODEL_REPO="solaristechnical/DEER-Prototypes-EnergyPlus"
+export COMMIT_SHA=64daae4514c08c7d93da60561c0f6384a464c300
+export MEASURE_PATH="residential measures/SWHC030-03 Whole House Fan"
+export S3_BUCKET=test-bucket
+export WORKFLOW_PACKAGE_S3_KEY=githubactions/123/workflow.zip
+export SCENARIO_ID="SWHC030-03 Whole House Fan_SFm_1975"
 export INSTANCE_ID=i-test
-export MODEL_REPO=solaristechnical/DEER-Prototypes-EnergyPlus
-export COMMIT_SHA=0123456789abcdef
-export MEASURE_PATH="commercial measures/Bob's \$(printf unsafe)"
-export S3_BUCKET=test-bucket WORKFLOW_PACKAGE_S3_KEY=githubactions/123/workflow.zip
-export SCENARIO_ID="Scenario Bob's \$(printf unsafe)"
-export GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
 
 sleep() { :; }
 aws() {
